@@ -249,6 +249,21 @@ Deno.test("should error in the shell when the command can't be found", async () 
   assertEquals(output.stderr, "dax: nonexistentcommanddaxtest: command not found\n");
 });
 
+Deno.test({
+  name: "resolves a relative path command to its Windows PATHEXT extension",
+  ignore: process.platform !== "win32",
+  fn: async () => {
+    await withTempDir(async (tempDir) => {
+      const binaryCopy = tempDir.join("my-dax-test-binary.exe");
+      fs.copyFileSync(process.execPath, binaryCopy.toString());
+      // reference the binary by its relative path without the .exe extension
+      const result = await $`./my-dax-test-binary --version`.stdout("piped");
+      assertEquals(result.code, 0);
+      assert(result.stdout.length > 0);
+    });
+  },
+});
+
 Deno.test("throws when providing an object that doesn't override toString", async () => {
   {
     const obj1 = {};

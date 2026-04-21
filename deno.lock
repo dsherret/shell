@@ -6,8 +6,8 @@
     "jsr:@david/path@0.3": "0.3.1",
     "jsr:@david/temp@~0.2.1": "0.2.1",
     "jsr:@david/which@0.3": "0.3.0",
+    "jsr:@david/which@0.6": "0.6.0",
     "jsr:@david/which@~0.4.1": "0.4.2",
-    "jsr:@david/which@~0.5.2": "0.5.2",
     "jsr:@std/assert@0.213": "0.213.1",
     "jsr:@std/assert@0.221": "0.221.0",
     "jsr:@std/assert@1": "1.0.19",
@@ -71,8 +71,8 @@
     "@david/which@0.4.2": {
       "integrity": "440ee262bc0673b57a39ad4d0dc5673e515ddd41c049a55b2588a0881e5d4a8c"
     },
-    "@david/which@0.5.2": {
-      "integrity": "cd284a87aecdb8e32a5b91a024813fb57cbb8b4889df7d1c90351f073a4301a9"
+    "@david/which@0.6.0": {
+      "integrity": "efe63f07f6741b12b0d470a660f5c20dedf0af0e0c18b5c934d8a930bcaba4bf"
     },
     "@std/assert@0.213.1": {
       "integrity": "24c28178b30c8e0782c18e8e94ea72b16282207569cdd10ffb9d1d26f2edebfe"
@@ -176,7 +176,7 @@
     "dependencies": [
       "jsr:@david/path@0.3",
       "jsr:@david/temp@~0.2.1",
-      "jsr:@david/which@~0.5.2",
+      "jsr:@david/which@0.6",
       "jsr:@std/assert@1",
       "jsr:@std/fmt@1",
       "jsr:@std/io@0.225",

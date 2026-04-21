@@ -1107,9 +1107,15 @@ interface UnresolvedCommand {
 
 async function resolveCommand(unresolvedCommand: UnresolvedCommand, context: Context): Promise<ResolvedCommand> {
   if (unresolvedCommand.name.includes("/") || isWindows && unresolvedCommand.name.includes("\\")) {
-    const commandPath = path.isAbsolute(unresolvedCommand.name)
+    const absolutePath = path.isAbsolute(unresolvedCommand.name)
       ? unresolvedCommand.name
       : path.resolve(unresolvedCommand.baseDir, unresolvedCommand.name);
+    // on Windows, this resolves `./foo` to `./foo.exe` when `./foo` itself
+    // doesn't exist but an executable with a PATHEXT extension does
+    const commandPath = await whichFromContext(absolutePath, context);
+    if (commandPath == null) {
+      return false;
+    }
     // only bother checking for a shebang when the path has a slash
     // in it because for global commands someone on Windows likely
     // won't have a script with a shebang in it on Windows
