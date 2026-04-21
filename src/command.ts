@@ -742,6 +742,28 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
   }
 
   /**
+   * Streams the command's output and iterates over its lines without
+   * buffering everything into memory.
+   *
+   * Lines are split at `\n` or `\r\n`. Line terminators are not included.
+   * A trailing blank line caused by a final line ending is excluded (matches
+   * [Rust's `str::lines`](https://doc.rust-lang.org/std/primitive.str.html#method.lines)).
+   *
+   * If iteration is abandoned before the end of the output is reached, the
+   * child process is killed.
+   *
+   * ```ts
+   * for await (const line of $`cat big.txt`.linesIter()) {
+   *   console.log(line);
+   * }
+   * ```
+   */
+  linesIter(kind: Exclude<StreamKind, "combined"> = "stdout"): AsyncIterableIterator<string> {
+    const child = this.quiet(kind).spawn();
+    return iterateLines(child, kind);
+  }
+
+  /**
    * Sets stream (stdout by default) as quiet, spawns the command, and gets stream as JSON.
    *
    * Shorthand for:
@@ -1786,4 +1808,53 @@ function attachCallerStack(err: unknown, callerStack: string | undefined): void 
   const frames = callerStack.slice(newlineIdx + 1);
   if (frames.length === 0) return;
   err.stack = err.stack == null ? frames : `${err.stack}\n${frames}`;
+}
+
+async function* iterateLines(
+  child: CommandChild,
+  kind: "stdout" | "stderr",
+): AsyncIterableIterator<string> {
+  const stream = kind === "stdout" ? child.stdout() : child.stderr();
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.length === 0) continue;
+      buffer += decoder.decode(value, { stream: true });
+      let start = 0;
+      while (true) {
+        const nl = buffer.indexOf("\n", start);
+        if (nl === -1) break;
+        // strip \r when it immediately precedes \n
+        const end = nl > start && buffer.charCodeAt(nl - 1) === 13 ? nl - 1 : nl;
+        yield buffer.substring(start, end);
+        start = nl + 1;
+      }
+      if (start > 0) buffer = buffer.substring(start);
+    }
+    buffer += decoder.decode();
+    // a final line ending does not produce a trailing blank line
+    if (buffer !== "") yield buffer;
+    completed = true;
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+    if (!completed) {
+      child.kill();
+      try {
+        await child;
+      } catch {
+        // swallow — the child was killed because iteration was abandoned
+      }
+    } else {
+      await child;
+    }
+  }
 }
