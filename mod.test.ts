@@ -1188,6 +1188,172 @@ Deno.test("command .lines('combined')", async () => {
   assertEquals(result.sort(), ["1", "2"]);
 });
 
+Deno.test("command .linesIter() - basic", async () => {
+  const lines: string[] = [];
+  for await (const line of $`echo 1 && echo 2`.linesIter()) {
+    lines.push(line);
+  }
+  assertEquals(lines, ["1", "2"]);
+});
+
+Deno.test("command .linesIter() - drops only trailing blank line from final newline", async () => {
+  const cases: { input: string; expected: string[] }[] = [
+    // trailing newline is not a blank line
+    { input: "a\nb\n", expected: ["a", "b"] },
+    // no trailing newline
+    { input: "a\nb", expected: ["a", "b"] },
+    // \r\n line endings
+    { input: "a\r\nb\r\n", expected: ["a", "b"] },
+    // embedded blank lines are preserved
+    { input: "a\n\nb", expected: ["a", "", "b"] },
+    // double trailing newline drops only the final blank
+    { input: "a\n\n", expected: ["a", ""] },
+    // standalone \r is part of the line
+    { input: "a\rb\n", expected: ["a\rb"] },
+    // empty output
+    { input: "", expected: [] },
+    // single newline
+    { input: "\n", expected: [""] },
+    // \r\n only
+    { input: "\r\n", expected: [""] },
+    // mixed endings
+    { input: "a\nb\r\nc\n", expected: ["a", "b", "c"] },
+  ];
+  for (const { input, expected } of cases) {
+    const lines: string[] = [];
+    const cmd = $`deno eval ${`await Deno.stdout.write(new TextEncoder().encode(${JSON.stringify(input)}));`}`;
+    for await (const line of cmd.linesIter()) {
+      lines.push(line);
+    }
+    assertEquals(lines, expected, `input ${JSON.stringify(input)}`);
+  }
+});
+
+Deno.test("command .linesIter('stderr')", async () => {
+  const lines: string[] = [];
+  const cmd = $`deno eval "console.error('a'); console.error('b')"`.env("NO_COLOR", "1");
+  for await (const line of cmd.linesIter("stderr")) {
+    lines.push(line);
+  }
+  assertEquals(lines, ["a", "b"]);
+});
+
+Deno.test("command .linesIter() - streams across read-buffer boundaries", async () => {
+  // build ~200KB across ~2000 lines with mixed \n and \r\n, larger than
+  // typical pipe read-buffer sizes, to exercise line-crossing behavior.
+  const expected: string[] = [];
+  const parts: string[] = [];
+  for (let i = 0; i < 2000; i++) {
+    const line = `line-${i}-` + "x".repeat((i % 97) + 5);
+    expected.push(line);
+    parts.push(line);
+    parts.push(i % 2 === 0 ? "\n" : "\r\n");
+  }
+  const payload = parts.join("");
+  // write payload via stdin and cat it back — avoids command-line size limits.
+  const lines: string[] = [];
+  for await (const line of $`cat`.stdinText(payload).linesIter()) {
+    lines.push(line);
+  }
+  assertEquals(lines, expected);
+});
+
+Deno.test("command .linesIter() - handles multi-byte UTF-8 split across chunk boundaries", async () => {
+  // enough characters to cross pipe-buffer boundaries where a single
+  // code point can straddle two reads.
+  const expected: string[] = [];
+  const parts: string[] = [];
+  for (let i = 0; i < 5000; i++) {
+    const line = `これはテスト-${i}`;
+    expected.push(line);
+    parts.push(line);
+    parts.push("\n");
+  }
+  const payload = parts.join("");
+  const lines: string[] = [];
+  for await (const line of $`cat`.stdinText(payload).linesIter()) {
+    lines.push(line);
+  }
+  assertEquals(lines, expected);
+});
+
+Deno.test("command .linesIter() - streams lazily (yields before process exits)", async () => {
+  // emit a line, sleep, emit another — ensure we get the first line
+  // before the process finishes.
+  const script = `
+    const enc = new TextEncoder();
+    await Deno.stdout.write(enc.encode("first\\n"));
+    await new Promise((r) => setTimeout(r, 200));
+    await Deno.stdout.write(enc.encode("second\\n"));
+  `;
+  const timestamps: number[] = [];
+  const lines: string[] = [];
+  const start = Date.now();
+  for await (const line of $`deno eval ${script}`.linesIter()) {
+    timestamps.push(Date.now() - start);
+    lines.push(line);
+  }
+  assertEquals(lines, ["first", "second"]);
+  // first line should arrive meaningfully before the second; allow slack for
+  // process startup and CI jitter but enforce there's a gap.
+  assert(
+    timestamps[1] - timestamps[0] >= 100,
+    `expected a gap between lines, got ${timestamps[0]}ms and ${timestamps[1]}ms`,
+  );
+});
+
+Deno.test("command .linesIter() - early break kills child and doesn't throw", async () => {
+  // a long-running command that would otherwise never finish on its own.
+  const script = `
+    const enc = new TextEncoder();
+    while (true) {
+      await Deno.stdout.write(enc.encode("tick\\n"));
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  `;
+  let count = 0;
+  for await (const line of $`deno eval ${script}`.linesIter()) {
+    assertEquals(line, "tick");
+    if (++count >= 3) break;
+  }
+  assertEquals(count, 3);
+});
+
+Deno.test("command .linesIter() - throws on non-zero exit when fully consumed", async () => {
+  await assertRejects(
+    async () => {
+      for await (const _line of $`deno eval "console.log('x'); Deno.exit(1)"`.linesIter()) {
+        // consume all
+      }
+    },
+    Error,
+  );
+});
+
+Deno.test("command .linesIter() - noThrow suppresses non-zero exit error", async () => {
+  const lines: string[] = [];
+  for await (const line of $`deno eval "console.log('x'); Deno.exit(1)"`.noThrow().linesIter()) {
+    lines.push(line);
+  }
+  assertEquals(lines, ["x"]);
+});
+
+Deno.test("command .linesIter() - works when stdout already set to piped", async () => {
+  const lines: string[] = [];
+  for await (const line of $`echo hi`.stdout("piped").linesIter()) {
+    lines.push(line);
+  }
+  assertEquals(lines, ["hi"]);
+});
+
+Deno.test("command .linesIter() - no output yields nothing", async () => {
+  const lines: string[] = [];
+  for await (const line of $`deno eval ""`.linesIter()) {
+    lines.push(line);
+  }
+  assertEquals(lines, []);
+});
+
 Deno.test("piping in command", async () => {
   await withTempDir(async (tempDir) => {
     const result = await $`echo 1 | cat - > output.txt`.cwd(tempDir).text();
