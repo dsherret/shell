@@ -211,6 +211,25 @@ Deno.test("should include caller frame in error stack for failed commands", asyn
   // frame is dropped when a Promise is rejected from within an async
   // executor. the library captures the caller's stack at .then/.spawn and
   // appends it to the thrown error.
+  //
+  // relies on V8 propagating async stack frames through thenable `.then`
+  // calls — fixed in https://chromium-review.googlesource.com/c/v8/v8/+/6826001
+  // (merged 2025-08-07). skip on engines whose V8 predates that fix.
+  async function probeAsyncFrames(): Promise<boolean> {
+    let captured = "";
+    await {
+      then(resolve: () => void) {
+        const holder: { stack?: string } = {};
+        // deno-lint-ignore no-explicit-any
+        (Error as any).captureStackTrace?.(holder);
+        captured = holder.stack ?? "";
+        resolve();
+      },
+    };
+    return captured.includes("probeAsyncFrames");
+  }
+  if (!(await probeAsyncFrames())) return;
+
   async function userFrameMarker() {
     await $`exit 7`;
   }

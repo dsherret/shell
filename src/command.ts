@@ -1777,9 +1777,13 @@ function attachCallerStack(err: unknown, callerStack: string | undefined): void 
     return;
   }
   // callerStack is of the form "Error\n    at ...\n    at ..." — drop the
-  // leading "Error" marker so the frames concatenate cleanly.
+  // leading "Error" marker so the frames concatenate cleanly. older V8
+  // versions (before https://crrev.com/c/6826001) don't propagate async
+  // frames through thenable `.then` calls, leaving us with just "Error"
+  // and nothing useful to append.
   const newlineIdx = callerStack.indexOf("\n");
-  const frames = newlineIdx === -1 ? callerStack : callerStack.slice(newlineIdx + 1);
+  if (newlineIdx === -1) return;
+  const frames = callerStack.slice(newlineIdx + 1);
   if (frames.length === 0) return;
   err.stack = err.stack == null ? frames : `${err.stack}\n${frames}`;
 }
