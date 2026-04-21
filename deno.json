@@ -8,7 +8,7 @@
   },
   "tasks": {
     "test": "deno test -P && deno task test:node",
-    "test:node": "npx --yes github:dsherret/deno-test#fix_work_on_windows",
+    "test:node": "unset FORCE_COLOR && npx --yes github:dsherret/deno-test#fix_work_on_windows",
     "wasmbuild": "deno run -A jsr:@deno/wasmbuild@0.19.2 --inline --out ./src/lib"
   },
   "fmt": {
@@ -46,6 +46,6 @@
     "@std/fmt": "jsr:@std/fmt@1",
     "@std/io": "jsr:@std/io@^0.225",
     "@std/path": "jsr:@std/path@1",
-    "which": "jsr:@david/which@^0.5.1"
+    "which": "jsr:@david/which@^0.5.2"
   }
 }
