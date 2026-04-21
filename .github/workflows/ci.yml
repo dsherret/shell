@@ -1,0 +1,65 @@
+name: ci
+
+on: [push, pull_request]
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: shell-${{ matrix.os }}
+    if: |
+      github.event_name == 'push' ||
+      !startsWith(github.event.pull_request.head.label, 'dsherret:')
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: canary
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+
+      - uses: dprint/check@v2.3
+        if: runner.os == 'Linux'
+
+      - name: lint
+        if: runner.os == 'Linux'
+        run: deno lint
+
+      - name: check
+        if: runner.os == 'Linux'
+        run: deno check
+
+      - name: deno test
+        run: deno test -P
+
+      - name: node test
+        run: deno task test:node
+
+  jsr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: canary
+      - name: Publish to JSR on tag
+        run: deno run -A jsr:@david/publish-on-tag@0.2.0
