@@ -219,7 +219,11 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     onfulfilled?: ((value: CommandResult) => TResult1 | PromiseLike<TResult1>) | null | undefined,
     onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null | undefined,
   ): PromiseLike<TResult1 | TResult2> {
-    return this.spawn().then(onfulfilled).catch(onrejected);
+    // capture the caller's stack here — after we enter the async executor in
+    // parseAndSpawnCommand, the awaiter's frame is no longer reachable from
+    // the thrown error's async chain.
+    const callerStack = captureCallerStack(this.then);
+    return parseAndSpawnCommand(this.#getClonedState(), callerStack).then(onfulfilled).catch(onrejected);
   }
 
   /**
@@ -231,7 +235,8 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     // store a snapshot of the current command
     // in case someone wants to spawn multiple
     // commands with different state
-    return parseAndSpawnCommand(this.#getClonedState());
+    const callerStack = captureCallerStack(this.spawn);
+    return parseAndSpawnCommand(this.#getClonedState(), callerStack);
   }
 
   /**
@@ -860,7 +865,7 @@ export class CommandChild extends Promise<CommandResult> {
   }
 }
 
-export function parseAndSpawnCommand(state: CommandBuilderState) {
+export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: string) {
   if (state.command == null) {
     throw new Error("A command must be set before it can be spawned.");
   }
@@ -961,6 +966,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState) {
       );
       const maybeError = await cleanupDisposablesAndMaybeGetError(undefined);
       if (maybeError) {
+        attachCallerStack(maybeError, callerStack);
         reject(maybeError);
       } else {
         resolve(result);
@@ -968,7 +974,9 @@ export function parseAndSpawnCommand(state: CommandBuilderState) {
     } catch (err) {
       finalizeCommandResultBufferForError(stdoutBuffer, err as Error);
       finalizeCommandResultBufferForError(stderrBuffer, err as Error);
-      reject(await cleanupDisposablesAndMaybeGetError(err));
+      const rejectErr = await cleanupDisposablesAndMaybeGetError(err);
+      attachCallerStack(rejectErr, callerStack);
+      reject(rejectErr);
     }
   }, {
     pipedStdoutBuffer: stdoutBuffer instanceof PipedBuffer ? stdoutBuffer : undefined,
@@ -1745,4 +1753,37 @@ function isAwaitableReadable(value: unknown): value is AwaitableReadable {
   return value != null
     && (typeof value === "object" || typeof value === "function")
     && typeof (value as { then?: unknown }).then === "function";
+}
+
+// V8's zero-cost async stack traces follow the await chain. Once the
+// rejection path enters an async executor and calls `reject(err)`, the
+// awaiter is no longer reachable — so errors thrown from a failed command
+// don't include the user's `await $\`cmd\`` frame. To work around this we
+// snapshot the caller's stack at the library entry point (`.then`/`.spawn`)
+// while the user's frame is still on the call stack, and append it to the
+// error's stack right before rejecting.
+function captureCallerStack(skipUpTo: (...args: never[]) => unknown): string | undefined {
+  const captureFn = (Error as { captureStackTrace?: (target: object, skipUpTo: Function) => void }).captureStackTrace;
+  if (captureFn == null) {
+    return new Error().stack;
+  }
+  const holder: { stack?: string } = {};
+  captureFn(holder, skipUpTo);
+  return holder.stack;
+}
+
+function attachCallerStack(err: unknown, callerStack: string | undefined): void {
+  if (callerStack == null || !(err instanceof Error)) {
+    return;
+  }
+  // callerStack is of the form "Error\n    at ...\n    at ..." — drop the
+  // leading "Error" marker so the frames concatenate cleanly. older V8
+  // versions (before https://crrev.com/c/6826001) don't propagate async
+  // frames through thenable `.then` calls, leaving us with just "Error"
+  // and nothing useful to append.
+  const newlineIdx = callerStack.indexOf("\n");
+  if (newlineIdx === -1) return;
+  const frames = callerStack.slice(newlineIdx + 1);
+  if (frames.length === 0) return;
+  err.stack = err.stack == null ? frames : `${err.stack}\n${frames}`;
 }

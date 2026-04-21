@@ -206,6 +206,43 @@ Deno.test("should throw when exit code is non-zero", async () => {
   );
 });
 
+Deno.test("should include caller frame in error stack for failed commands", async () => {
+  // guards against the V8 async-stack-trace limitation where the awaiter's
+  // frame is dropped when a Promise is rejected from within an async
+  // executor. the library captures the caller's stack at .then/.spawn and
+  // appends it to the thrown error.
+  //
+  // relies on V8 propagating async stack frames through thenable `.then`
+  // calls — fixed in https://chromium-review.googlesource.com/c/v8/v8/+/6826001
+  // (merged 2025-08-07). skip on engines whose V8 predates that fix.
+  async function probeAsyncFrames(): Promise<boolean> {
+    let captured = "";
+    await {
+      then(resolve: () => void) {
+        const holder: { stack?: string } = {};
+        // deno-lint-ignore no-explicit-any
+        (Error as any).captureStackTrace?.(holder);
+        captured = holder.stack ?? "";
+        resolve();
+      },
+    };
+    return captured.includes("probeAsyncFrames");
+  }
+  if (!(await probeAsyncFrames())) return;
+
+  async function userFrameMarker() {
+    await $`exit 7`;
+  }
+  let err: Error | undefined;
+  try {
+    await userFrameMarker();
+  } catch (e) {
+    err = e as Error;
+  }
+  assert(err != null, "expected command to reject");
+  assertStringIncludes(err.stack ?? "", "userFrameMarker");
+});
+
 Deno.test("should error in the shell when the command can't be found", async () => {
   const output = await $`nonexistentcommanddaxtest`.noThrow().stderr("piped");
   assertEquals(output.code, 127);
