@@ -2,7 +2,7 @@
   "version": "5",
   "specifiers": {
     "jsr:@david/path@0.3": "0.3.1",
-    "jsr:@david/temp@0.2": "0.2.0",
+    "jsr:@david/temp@~0.2.1": "0.2.1",
     "jsr:@david/which@~0.5.1": "0.5.1",
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/bytes@^1.0.6": "1.0.6",
@@ -15,8 +15,8 @@
     "@david/path@0.3.1": {
       "integrity": "25e31e27ba87832af880e103807afb698548069ab14a274a64d553f45bd49393"
     },
-    "@david/temp@0.2.0": {
-      "integrity": "1759b3237a3f83d42b2ef44b9d7184eb5a7b825c7d7c9d17ae5fba0c4ed9b147",
+    "@david/temp@0.2.1": {
+      "integrity": "2cae69d8ddebe9c305378bd393b63a03d489fae2a46a59f8918a1d83311204c8",
       "dependencies": [
         "jsr:@david/path"
       ]
@@ -55,7 +55,7 @@
   "workspace": {
     "dependencies": [
       "jsr:@david/path@0.3",
-      "jsr:@david/temp@0.2",
+      "jsr:@david/temp@~0.2.1",
       "jsr:@david/which@~0.5.1",
       "jsr:@std/assert@1",
       "jsr:@std/fmt@1",
