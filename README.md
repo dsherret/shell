@@ -2,9 +2,9 @@
 
 [![JSR](https://jsr.io/badges/@david/shell)](https://jsr.io/@david/shell)
 
-Command execution and shell parser used by [`@david/dax`](https://jsr.io/@david/dax).
+Command execution and shell parser used by [`dax`](https://github.com/dsherret/dax).
 
-Most users should reach for `@david/dax` — it builds on this package and adds progress bars, logging, `request`, `which`, and other conveniences. Use `@david/shell` directly when you want just the shell layer.
+Most users should reach for `dax` — it builds on this package and adds progress bars, logging, `request`, `which`, and other conveniences. Use `@david/shell` directly when you want just the shell layer.
 
 Works on Deno and Node.js.
 
