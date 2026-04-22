@@ -39,6 +39,7 @@ dependencies = [
 [[package]]
 name = "deno_task_shell"
 version = "0.29.0"
+source = "git+https://github.com/dsherret/deno_task_shell.git?branch=feat_support_multiline_commands#62da2920a79b9b50cd387186d221904e9609c885"
 dependencies = [
  "anyhow",
  "bitflags",
