@@ -218,7 +218,6 @@ lo"`.stdout("piped");
   assertEquals(output.stdout, "hello\n");
 });
 
-
 Deno.test("should not get stdout when set to writer", async () => {
   const buffer = new Buffer();
   const output = await $`echo 5`.stdout(buffer);
