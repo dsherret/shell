@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1.6"
-deno_task_shell = { version = "0.29.0", default-features = false, features = ["serialization"] }
+deno_task_shell = { path = "V:/deno_task_shell", default-features = false, features = ["serialization"] }
 js-sys = "=0.3.77"
 serde = "1"
 serde-wasm-bindgen = "=0.6.5"

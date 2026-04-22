@@ -28,6 +28,7 @@ export interface SequentialList {
 
 export interface SequentialListItem {
   isAsync: boolean;
+  endsLine: boolean;
   sequence: Sequence;
 }
 
@@ -339,6 +340,8 @@ export interface ShellOptionsState {
   globstar: boolean;
   /** When set, ? matches any single character in glob patterns. */
   questionGlob: boolean;
+  /** When set, abort a sequential list at the first non-zero command. */
+  errexit: boolean;
 }
 
 /** State that never changes across the entire execution of the shell. */
@@ -563,20 +566,27 @@ export interface SpawnOpts {
   shellOptions?: Partial<ShellOptionsState>;
 }
 
-function getDefaultShellOptions(): ShellOptionsState {
+function getDefaultShellOptions(list: SequentialList): ShellOptionsState {
   return {
     nullglob: false,
     failglob: false, // default: pass unmatched globs through literally
     pipefail: false,
     globstar: true, // default: ** matches recursively
     questionGlob: false, // default: ? is literal
+    // on by default for multi-line input so a failing line stops the rest;
+    // single-line `a; b` keeps running through failures.
+    errexit: isMultiLine(list),
   };
+}
+
+function isMultiLine(list: SequentialList): boolean {
+  return list.items.some((item) => item.endsLine);
 }
 
 export async function spawn(list: SequentialList, opts: SpawnOpts) {
   const env = opts.exportEnv ? opts.clearedEnv ? new RealEnvWriteOnly() : new RealEnv() : new ShellEnv();
   initializeEnv(env, opts);
-  const defaultOptions = getDefaultShellOptions();
+  const defaultOptions = getDefaultShellOptions(list);
   const context = new Context({
     env,
     stdin: opts.stdin,
@@ -618,6 +628,9 @@ async function executeSequentialList(list: SequentialList, context: Context): Pr
       default: {
         const _assertNever: never = result;
       }
+    }
+    if (finalExitCode !== 0 && context.getShellOptions().errexit) {
+      break;
     }
   }
   return {

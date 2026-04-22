@@ -62,6 +62,163 @@ Deno.test("allows leading and trailing whitespace", async () => {
   assertEquals(output.stdout, "5\n");
 });
 
+Deno.test("multi-line: lines run in order", async () => {
+  const output = await $`
+    echo one
+    echo two
+    echo three
+  `.stdout("piped");
+  assertEquals(output.code, 0);
+  assertEquals(output.stdout, "one\ntwo\nthree\n");
+});
+
+Deno.test("multi-line: stops at the first failing line and surfaces its exit code", async () => {
+  const output = await $`
+    echo before
+    exit 3
+    echo after
+  `.stdout("piped").noThrow();
+  assertEquals(output.code, 3);
+  assertEquals(output.stdout, "before\n");
+});
+
+Deno.test("multi-line: blank lines between commands are skipped", async () => {
+  const output = await $`
+    echo one
+
+
+    echo two
+  `.stdout("piped");
+  assertEquals(output.stdout, "one\ntwo\n");
+});
+
+Deno.test("multi-line: tab-indented lines still run", async () => {
+  const output = await $`
+\techo one
+\techo two
+`.stdout("piped");
+  assertEquals(output.stdout, "one\ntwo\n");
+});
+
+Deno.test("multi-line: CRLF line endings are supported", async () => {
+  const output = await $`echo one\r\necho two`.stdout("piped");
+  assertEquals(output.stdout, "one\ntwo\n");
+});
+
+Deno.test("multi-line: an env var set earlier is visible to a later line", async () => {
+  const output = await $`
+    export FOO=bar
+    echo "$FOO"
+  `.stdout("piped");
+  assertEquals(output.stdout, "bar\n");
+});
+
+Deno.test("multi-line: a shell var assignment is visible to a later line", async () => {
+  const output = await $`
+    FOO=bar
+    echo "$FOO"
+  `.stdout("piped");
+  assertEquals(output.stdout, "bar\n");
+});
+
+Deno.test("multi-line: a trailing `&&` continues onto the next line", async () => {
+  const output = await $`
+    echo one &&
+      echo two
+  `.stdout("piped");
+  assertEquals(output.stdout, "one\ntwo\n");
+});
+
+Deno.test("multi-line: a trailing `||` continues onto the next line", async () => {
+  // use a subshell so the failing command doesn't exit the whole script
+  const output = await $`
+    (exit 3) ||
+      echo recovered
+  `.stdout("piped");
+  assertEquals(output.code, 0);
+  assertEquals(output.stdout, "recovered\n");
+});
+
+Deno.test("multi-line: a trailing pipe continues onto the next line", async () => {
+  const output = await $`
+    echo hello |
+      deno eval "for await (const _ of Deno.stdin.readable) {} console.log('piped')"
+  `.stdout("piped");
+  assertEquals(output.stdout, "piped\n");
+});
+
+Deno.test("multi-line: a newline inside double quotes is preserved", async () => {
+  const output = await $`echo "hello
+world"`.stdout("piped");
+  assertEquals(output.stdout, "hello\nworld\n");
+});
+
+Deno.test("multi-line: a newline inside single quotes is preserved", async () => {
+  const output = await $`echo 'hello
+world'`.stdout("piped");
+  assertEquals(output.stdout, "hello\nworld\n");
+});
+
+Deno.test("multi-line: errexit is on by default so a failing line aborts the rest", async () => {
+  const output = await $`
+    echo first
+    (exit 3)
+    echo unreachable
+  `.stdout("piped").noThrow();
+  assertEquals(output.code, 3);
+  assertEquals(output.stdout, "first\n");
+});
+
+Deno.test("single-line: `a; b` does NOT fail-fast — b runs even if a fails", async () => {
+  const output = await $`(exit 3); echo still-ran`.stdout("piped");
+  assertEquals(output.code, 0);
+  assertEquals(output.stdout, "still-ran\n");
+});
+
+Deno.test("multi-line: `set +e` in the script re-enables continue-on-failure", async () => {
+  const output = await $`
+    set +e
+    (exit 3)
+    echo still-ran
+  `.stdout("piped");
+  assertEquals(output.code, 0);
+  assertEquals(output.stdout, "still-ran\n");
+});
+
+Deno.test("single-line: `set -e` in the script opts into fail-fast", async () => {
+  const output = await $`set -e; (exit 3); echo unreachable`.stdout("piped").noThrow();
+  assertEquals(output.code, 3);
+  assertEquals(output.stdout, "");
+});
+
+Deno.test("errexit: failure inside `||` is tested, not aborted", async () => {
+  const output = await $`
+    (exit 3) || echo recovered
+    echo after
+  `.stdout("piped");
+  assertEquals(output.code, 0);
+  assertEquals(output.stdout, "recovered\nafter\n");
+});
+
+Deno.test("line continuation: backslash-newline between tokens is elided", async () => {
+  const output = await $`echo hello \
+world`.stdout("piped");
+  assertEquals(output.stdout, "hello world\n");
+});
+
+Deno.test("line continuation: backslash-newline inside a word joins the halves", async () => {
+  const output = await $`echo hel\
+lo`.stdout("piped");
+  assertEquals(output.stdout, "hello\n");
+});
+
+Deno.test("line continuation: backslash-newline inside double quotes joins the halves", async () => {
+  const output = await $`echo "hel\
+lo"`.stdout("piped");
+  assertEquals(output.stdout, "hello\n");
+});
+
+
 Deno.test("should not get stdout when set to writer", async () => {
   const buffer = new Buffer();
   const output = await $`echo 5`.stdout(buffer);
@@ -2569,22 +2726,22 @@ Deno.test("set command", async () => {
   // set -o (no option) - lists options
   const result4 = await $`set -o`.captureCombined(true);
   assertEquals(result4.code, 0);
-  assertEquals(result4.combined.trim(), "pipefail\toff");
+  assertEquals(result4.combined.trim(), "errexit\toff\npipefail\toff");
 
   // set -o after enabling pipefail shows on
   const result5 = await $`set -o pipefail && set -o`.captureCombined(true);
   assertEquals(result5.code, 0);
-  assertEquals(result5.combined.trim(), "pipefail\ton");
+  assertEquals(result5.combined.trim(), "errexit\toff\npipefail\ton");
 
   // set +o (no option) - outputs commands to recreate settings
   const result6 = await $`set +o`.captureCombined(true);
   assertEquals(result6.code, 0);
-  assertEquals(result6.combined.trim(), "set +o pipefail");
+  assertEquals(result6.combined.trim(), "set +o errexit\nset +o pipefail");
 
   // set +o after enabling pipefail
   const result7 = await $`set -o pipefail && set +o`.captureCombined(true);
   assertEquals(result7.code, 0);
-  assertEquals(result7.combined.trim(), "set -o pipefail");
+  assertEquals(result7.combined.trim(), "set +o errexit\nset -o pipefail");
 
   // error: unknown option
   const result8 = await $`set -o invalid`.noThrow().captureCombined(true);
