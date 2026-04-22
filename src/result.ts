@@ -88,8 +88,9 @@ export interface CdChange {
  * - `pipefail`: pipeline exit code is the rightmost non-zero exit code
  * - `globstar`: `**` matches recursively across directories (default)
  * - `questionGlob`: `?` matches any single character in glob patterns
+ * - `errexit`: abort a sequential list at the first non-zero command (`set -e`)
  */
-export type ShellOption = "nullglob" | "failglob" | "pipefail" | "globstar" | "questionGlob";
+export type ShellOption = "nullglob" | "failglob" | "pipefail" | "globstar" | "questionGlob" | "errexit";
 
 /** Change that sets a shell option (ex. `shopt -s nullglob` or `set -o pipefail`).
  *
