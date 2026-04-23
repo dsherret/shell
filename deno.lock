@@ -3,7 +3,7 @@
   "specifiers": {
     "jsr:@david/dax@0.39.2": "0.39.2",
     "jsr:@david/dax@0.41.0": "0.41.0",
-    "jsr:@david/path@0.3": "0.3.1",
+    "jsr:@david/path@0.3": "0.3.2",
     "jsr:@david/temp@~0.2.1": "0.2.1",
     "jsr:@david/which@0.3": "0.3.0",
     "jsr:@david/which@0.6": "0.6.0",
@@ -56,8 +56,8 @@
         "jsr:@std/streams@0.221.0"
       ]
     },
-    "@david/path@0.3.1": {
-      "integrity": "25e31e27ba87832af880e103807afb698548069ab14a274a64d553f45bd49393"
+    "@david/path@0.3.2": {
+      "integrity": "f25aaa3de4d3b9edfe25ca5edf15e3014fee7df4f77d64327e5300c27c1a0497"
     },
     "@david/temp@0.2.1": {
       "integrity": "2cae69d8ddebe9c305378bd393b63a03d489fae2a46a59f8918a1d83311204c8",
