@@ -1,4 +1,5 @@
 import { FsFileWrapper, Path } from "@david/path";
+import { staticText } from "@david/console-static-text";
 import * as colors from "@std/fmt/colors";
 import { Buffer } from "@std/io/buffer";
 import { readerFromStreamReader } from "@std/io/reader-from-stream-reader";
@@ -28,7 +29,6 @@ import {
   delayToMs,
   errorToString,
   getRealEnvVars,
-  hasStaticText,
   isWindows,
   LoggerTreeBox,
   symbols,
@@ -40,6 +40,7 @@ import {
   CapturingBufferWriter,
   CapturingBufferWriterSync,
   InheritStaticTextBypassWriter,
+  InheritTailWriter,
   NullPipeWriter,
   PipedBuffer,
   type Reader,
@@ -86,6 +87,7 @@ interface CommandBuilderState {
   combinedStdoutStderr: boolean;
   stdout: ShellPipeWriterKindWithOptions;
   stderr: ShellPipeWriterKindWithOptions;
+  tailDisplay: boolean;
   noThrow: boolean | number[];
   env: Record<string, string | undefined>;
   commands: Record<string, CommandHandler>;
@@ -160,6 +162,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     stderr: {
       kind: "inherit",
     },
+    tailDisplay: false,
     noThrow: false,
     env: {},
     cwd: undefined,
@@ -192,6 +195,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         kind: state.stderr.kind,
         options: state.stderr.options,
       },
+      tailDisplay: state.tailDisplay,
       noThrow: state.noThrow instanceof Array ? [...state.noThrow] : state.noThrow,
       env: { ...state.env },
       cwd: state.cwd,
@@ -421,6 +425,29 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         kind,
         options,
       };
+    });
+  }
+
+  /**
+   * Enables Docker-style partial scrolling for any `"inherit"` or
+   * `"inheritPiped"` output: only the last few lines are shown in a
+   * static region at the bottom of the terminal while the command
+   * runs. When both stdout and stderr are being displayed, they
+   * interleave into a single shared scrolling region with one header.
+   *
+   * On success the region is cleared (header promotes to scrollback);
+   * on error the retained tail is flushed above so the user can see
+   * what happened. Has no effect on non-TTY output or on streams
+   * routed elsewhere (piped, null, WritableStream, Path, etc.).
+   *
+   * @example
+   * ```ts
+   * await $`./build.sh`.tailDisplay();
+   * ```
+   */
+  tailDisplay(value = true): CommandBuilder {
+    return this.#newWithState((state) => {
+      state.tailDisplay = value;
     });
   }
 
@@ -893,7 +920,13 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   }
 
   if (state.printCommand) {
-    state.printCommandLogger.getValue()(state.command.text);
+    // when tailDisplay is on, the scrolling region's header already shows
+    // the command text while running and gets promoted to scrollback on
+    // finalize — skip the upfront log so we don't print the command twice
+    // (once at start, once at end).
+    if (!state.tailDisplay) {
+      state.printCommandLogger.getValue()(state.command.text);
+    }
   }
 
   const disposables: Disposable[] = [];
@@ -929,13 +962,32 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       },
     });
   }
-  const [stdoutBuffer, stderrBuffer, combinedBuffer] = getBuffers();
+  const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
+  // label active tail scrolling regions with the command text so it's
+  // obvious which command the tail belongs to, especially when running
+  // commands in parallel. on finalize the header is promoted to scrollback
+  // so "which commands ran" is still visible after the tail clears.
+  for (const tw of tailWriters) {
+    tw.setHeader(state.command.text);
+  }
+  // when tailDisplay is on for an `"inherit"` stream we need Node's spawn
+  // to pipe the child's output through us instead of connecting the child
+  // directly to the parent's fd (which would bypass the InheritTailWriter
+  // entirely). report the kind as `"inheritPiped"` at the shell level so
+  // the executable handler reads from the pipe and forwards bytes through
+  // our writer chain. user-facing `state.stdout.kind` stays `"inherit"`.
+  const stdoutShellKind = state.tailDisplay && state.stdout.kind === "inherit"
+    ? "inheritPiped" as const
+    : state.stdout.kind;
+  const stderrShellKind = state.tailDisplay && state.stderr.kind === "inherit"
+    ? "inheritPiped" as const
+    : state.stderr.kind;
   const stdout = new ShellPipeWriter(
-    state.stdout.kind,
+    stdoutShellKind,
     stdoutBuffer === "null" ? new NullPipeWriter() : stdoutBuffer === "inherit" ? stdoutStream : stdoutBuffer,
   );
   const stderr = new ShellPipeWriter(
-    state.stderr.kind,
+    stderrShellKind,
     stderrBuffer === "null" ? new NullPipeWriter() : stderrBuffer === "inherit" ? stderrStream : stderrBuffer,
   );
   const { text: commandText, fds } = state.command;
@@ -979,6 +1031,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
           }
         }
       }
+      for (const tw of tailWriters) tw.finalize();
       const result = new CommandResult(
         code,
         finalizeCommandResultBuffer(stdoutBuffer),
@@ -994,6 +1047,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
         resolve(result);
       }
     } catch (err) {
+      for (const tw of tailWriters) tw.finalizeForError();
       finalizeCommandResultBufferForError(stdoutBuffer, err as Error);
       finalizeCommandResultBufferForError(stderrBuffer, err as Error);
       const rejectErr = await cleanupDisposablesAndMaybeGetError(err);
@@ -1066,9 +1120,23 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   }
 
   function getBuffers() {
-    const hasProgressBars = hasStaticText();
-    const stdoutBuffer = getOutputBuffer(stdoutStream, state.stdout);
-    const stderrBuffer = getOutputBuffer(stderrStream, state.stderr);
+    const hasProgressBars = staticText.hasText();
+    // when tailDisplay is on, wrap any terminal-bound stream in an
+    // InheritTailWriter. when both stdout and stderr are tailed, share the
+    // scrolling region between them so the two streams interleave into one
+    // tail with a single header — mirrors how a user reads terminal output.
+    const stdoutTail = state.tailDisplay && canTail(state.stdout.kind)
+      ? new InheritTailWriter(stdoutStream)
+      : undefined;
+    const stderrTail = state.tailDisplay && canTail(state.stderr.kind)
+      ? (stdoutTail != null ? new InheritTailWriter(stderrStream, stdoutTail) : new InheritTailWriter(stderrStream))
+      : undefined;
+    const tailWriters: InheritTailWriter[] = [];
+    if (stdoutTail != null) tailWriters.push(stdoutTail);
+    if (stderrTail != null) tailWriters.push(stderrTail);
+
+    const stdoutBuffer = getOutputBuffer(stdoutStream, state.stdout, stdoutTail);
+    const stderrBuffer = getOutputBuffer(stderrStream, state.stderr, stderrTail);
     if (state.combinedStdoutStderr) {
       if (typeof stdoutBuffer === "string" || typeof stderrBuffer === "string") {
         throw new Error("Internal programming error. Expected writers for stdout and stderr.");
@@ -1078,9 +1146,14 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
         getCapturingBuffer(stdoutBuffer, combinedBuffer),
         getCapturingBuffer(stderrBuffer, combinedBuffer),
         combinedBuffer,
+        tailWriters,
       ] as const;
     }
-    return [stdoutBuffer, stderrBuffer, undefined] as const;
+    return [stdoutBuffer, stderrBuffer, undefined, tailWriters] as const;
+
+    function canTail(kind: ShellPipeWriterKind): boolean {
+      return kind === "inherit" || kind === "inheritPiped";
+    }
 
     function getCapturingBuffer(buffer: Writer | WriterSync, combinedBuffer: Buffer) {
       if ("write" in buffer) {
@@ -1090,7 +1163,11 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       }
     }
 
-    function getOutputBuffer(inheritWriter: WriterSync, { kind, options }: ShellPipeWriterKindWithOptions) {
+    function getOutputBuffer(
+      inheritWriter: WriterSync,
+      { kind, options }: ShellPipeWriterKindWithOptions,
+      tail: InheritTailWriter | undefined,
+    ) {
       if (typeof kind === "object") {
         if (kind instanceof Path) {
           const file = kind.openSync({ write: true, truncate: true, create: true });
@@ -1121,7 +1198,9 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       }
       switch (kind) {
         case "inherit":
-          if (hasProgressBars) {
+          if (tail != null) {
+            return tail;
+          } else if (hasProgressBars) {
             return new InheritStaticTextBypassWriter(inheritWriter);
           } else {
             return "inherit";
@@ -1129,7 +1208,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
         case "piped":
           return new PipedBuffer();
         case "inheritPiped":
-          return new CapturingBufferWriterSync(inheritWriter, new Buffer());
+          return new CapturingBufferWriterSync(tail ?? inheritWriter, new Buffer());
         case "null":
           return "null";
         default: {
@@ -1148,6 +1227,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       | CapturingBufferWriter
       | CapturingBufferWriterSync
       | InheritStaticTextBypassWriter
+      | InheritTailWriter
       | Writer
       | WriterSync,
   ): BufferStdio {
@@ -1155,6 +1235,10 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       return buffer.getBuffer();
     } else if (buffer instanceof InheritStaticTextBypassWriter) {
       buffer.flush(); // this is line buffered, so flush anything left
+      return "inherit";
+    } else if (buffer instanceof InheritTailWriter) {
+      // already finalized via the tailWriters loop; there's no capture for
+      // a plain inherit + tailDisplay stream so map it back to "inherit".
       return "inherit";
     } else if (buffer instanceof PipedBuffer) {
       buffer.close();
@@ -1174,6 +1258,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       | CapturingBufferWriter
       | CapturingBufferWriterSync
       | InheritStaticTextBypassWriter
+      | InheritTailWriter
       | Writer
       | WriterSync,
     error: Error,

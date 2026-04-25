@@ -1,11 +1,42 @@
 import type { FsFileWrapper, Path } from "@david/path";
+import { type ConsoleSize, renderInterval, staticText, type TextItem } from "@david/console-static-text";
+import * as colors from "@std/fmt/colors";
 import { Buffer } from "@std/io/buffer";
 import { writeAll, writeAllSync } from "@std/io/write-all";
 import type { CommandBuilder, KillSignal } from "./command.ts";
-import { abortSignalToPromise, withStaticTextClear } from "./common.ts";
+import { abortSignalToPromise } from "./common.ts";
+import { LineRingBuffer } from "./line_ring_buffer.ts";
 import type { Closer, Reader, ReaderSync, Writer, WriterSync } from "@std/io/types";
 import type { CommandPipeWriter } from "./command_handler.ts";
 export type { Closer, Reader, ReaderSync, Writer, WriterSync };
+
+// keep the shared render loop alive while shell is loaded so that our
+// tail-display scope (and other static text from the host) gets painted.
+const _renderScope: Disposable = renderInterval.start();
+const tailScope = staticText.createScope();
+const activeTailSegments: InheritTailState[] = [];
+
+function _renderTailScope(): void {
+  const items: TextItem[] = [];
+  for (const seg of activeTailSegments) {
+    if (seg.header != null) {
+      const header = seg.header;
+      items.push((size) => formatTailHeader(header, size));
+    }
+    for (const line of seg.lines.takeLast(seg.maxLines)) items.push(indentTailLine(line));
+  }
+  tailScope.setText(items);
+}
+
+/** 2-space indent for tail output, mirrors Docker's nested step output. */
+const TAIL_INDENT = "  ";
+
+/** Wraps a raw output line so it renders indented under the status header.
+ * Uses `hangingIndent` so soft-wrapped continuations align with the first
+ * column of indented content rather than snapping back to column 0. */
+function indentTailLine(line: string): TextItem {
+  return { text: TAIL_INDENT + line, hangingIndent: TAIL_INDENT.length };
+}
 
 const encoder = new TextEncoder();
 
@@ -177,11 +208,271 @@ export class InheritStaticTextBypassWriter implements WriterSync {
 
   flush() {
     const bytes = this.#buffer.bytes({ copy: false });
-    withStaticTextClear(() => {
+    staticText.withTempClear(() => {
       writeAllSync(this.#innerWriter, bytes);
     });
     this.#buffer.reset();
   }
+}
+
+/**
+ * Default number of lines to show in `.tailDisplay()` mode. Docker Compose
+ * shows a comparable-sized window; small enough not to dominate the terminal,
+ * large enough to convey progress.
+ */
+export const DEFAULT_INHERIT_TAIL_LINES = 5;
+
+/**
+ * Default number of lines to retain for error-time flushback. On error the
+ * live tail (5 lines) rarely shows what actually broke, so we keep a larger
+ * buffer and promote it to scrollback when the command fails.
+ */
+export const DEFAULT_INHERIT_TAIL_ERROR_LINES = 80;
+
+class InheritTailState {
+  readonly maxLines: number;
+  readonly lines: LineRingBuffer;
+  readonly enabled: boolean;
+  header: string | undefined;
+  promoteHeaderOnSuccess = false;
+  #refCount = 0;
+  #disposed = false;
+  #errored = false;
+  #trailingLines: string[] = [];
+  #registered = false;
+  #totalLinesSeen = 0;
+
+  constructor(maxLines: number, isTty: boolean, maxErrorLines: number = DEFAULT_INHERIT_TAIL_ERROR_LINES) {
+    this.maxLines = Math.max(1, maxLines);
+    // one ring sized to the larger error budget; the live tail is just the
+    // last `maxLines` slice of it, so no separate small buffer needed.
+    this.lines = new LineRingBuffer(Math.max(this.maxLines, maxErrorLines));
+    this.enabled = isTty;
+  }
+
+  get omittedLineCount(): number {
+    return Math.max(0, this.#totalLinesSeen - this.lines.size);
+  }
+
+  addRef(): void {
+    this.#refCount++;
+    if (this.enabled && !this.#registered && !this.#disposed) {
+      activeTailSegments.push(this);
+      this.#registered = true;
+    }
+  }
+
+  setHeader(text: string | undefined): void {
+    const trimmed = text == null ? undefined : text.replace(/\s+/g, " ").trim();
+    this.header = trimmed && trimmed.length > 0 ? trimmed : undefined;
+    this.#render();
+  }
+
+  appendLines(newLines: string[]): void {
+    if (this.#disposed) return;
+    this.#totalLinesSeen += newLines.length;
+    for (const line of newLines) this.lines.push(line);
+    this.#render();
+  }
+
+  #render(): void {
+    if (!this.enabled || this.#disposed) return;
+    _renderTailScope();
+  }
+
+  release(errored: boolean, trailing: string[]): void {
+    if (this.#disposed) return;
+    if (errored) this.#errored = true;
+    if (trailing.length > 0) this.#trailingLines.push(...trailing);
+    this.#refCount--;
+    if (this.#refCount > 0) return;
+    this.#disposed = true;
+    if (!this.enabled) return;
+    this.#flushAbove();
+    const idx = activeTailSegments.indexOf(this);
+    if (idx !== -1) activeTailSegments.splice(idx, 1);
+    _renderTailScope();
+  }
+
+  #flushAbove(): void {
+    const preserved: TextItem[] = [];
+    if (this.#errored) {
+      // emit the command header unconditionally on error so the scrollback
+      // always records which command failed (even if `.printCommand()` was
+      // off), in the same `> <cmd>` format the default printCommand logger
+      // uses so both renderings look uniform.
+      if (this.header != null) {
+        preserved.push(`${colors.white(">")} ${colors.blue(this.header)}`);
+      }
+      const omitted = this.omittedLineCount;
+      if (omitted > 0) {
+        const noun = omitted === 1 ? "line" : "lines";
+        preserved.push(indentTailLine(colors.dim(`...${omitted} ${noun} omitted...`)));
+      }
+      for (const line of this.lines) preserved.push(indentTailLine(line));
+      for (const line of this.#trailingLines) preserved.push(indentTailLine(line));
+    } else if (this.header != null) {
+      const header = this.header;
+      preserved.push((size) => formatRanHeader(header, size));
+    }
+    if (preserved.length > 0) tailScope.logAbove(preserved);
+  }
+
+}
+
+/**
+ * Docker-style partial scrolling writer.
+ *
+ * Instead of streaming command output straight to the terminal, this buffers
+ * output line-by-line and shows only the most recent `maxLines` lines inside
+ * a static text scope pinned to the bottom of the terminal. When the command
+ * finishes successfully, the scope is cleared (the header is promoted to
+ * scrollback); on error the retained tail is flushed above so the user can
+ * see what happened.
+ *
+ * Falls back to writing directly to `innerWriter` when the host process is
+ * not attached to a TTY, since there's nowhere to anchor a scrolling region.
+ *
+ * Pass an existing writer as the second argument to share its scrolling
+ * region — used internally when both stdout and stderr are tailed, so the
+ * two streams interleave into one scroll area with a single header.
+ */
+export class InheritTailWriter implements WriterSync, Disposable {
+  readonly #innerWriter: WriterSync;
+  readonly #state: InheritTailState;
+  readonly #decoder = new TextDecoder();
+  #pending = "";
+  #finalized = false;
+
+  constructor(innerWriter: WriterSync, maxLines?: number, isTty?: boolean);
+  constructor(innerWriter: WriterSync, sibling: InheritTailWriter);
+  constructor(
+    innerWriter: WriterSync,
+    maxLinesOrSibling: number | InheritTailWriter = DEFAULT_INHERIT_TAIL_LINES,
+    isTty: boolean = isStderrTty(),
+  ) {
+    this.#innerWriter = innerWriter;
+    if (typeof maxLinesOrSibling === "number") {
+      this.#state = new InheritTailState(maxLinesOrSibling, isTty);
+    } else {
+      this.#state = maxLinesOrSibling.#state;
+    }
+    this.#state.addRef();
+  }
+
+  /** Snapshot of the live tail (last `maxLines` retained lines, oldest
+   * first). */
+  get tailLines(): readonly string[] {
+    return Array.from(this.#state.lines.takeLast(this.#state.maxLines));
+  }
+
+  /** Number of completed lines that were dropped from the retained ring
+   * buffer because its capacity is bounded. Rendered as
+   * `...N lines omitted...` above the retained tail when the command fails. */
+  get omittedLineCount(): number {
+    return this.#state.omittedLineCount;
+  }
+
+  /**
+   * Sets a label rendered above the tail lines that identifies what this
+   * scrolling region is showing. Typically the command text. Empty/undefined
+   * removes the header. Long text is truncated to the terminal width.
+   */
+  setHeader(text: string | undefined): void {
+    this.#state.setHeader(text);
+  }
+
+  writeSync(p: Uint8Array): number {
+    if (this.#finalized) {
+      return p.length;
+    }
+    if (!this.#state.enabled) {
+      // no TTY to anchor a scrolling region — behave like plain inherit
+      return this.#innerWriter.writeSync(p);
+    }
+    this.#pending += this.#decoder.decode(p, { stream: true });
+    const lastNewline = this.#pending.lastIndexOf("\n");
+    if (lastNewline !== -1) {
+      const complete = this.#pending.slice(0, lastNewline);
+      this.#pending = this.#pending.slice(lastNewline + 1);
+      this.#state.appendLines(complete.split("\n").map(stripTrailingCR));
+    }
+    return p.length;
+  }
+
+  /**
+   * Clears the scrolling region. Called on successful command completion.
+   *
+   * If a header was set it's promoted to scrollback via `logAbove` before
+   * the scope is disposed, so "which commands ran" remains visible after
+   * the transient tail clears. When multiple writers share a scope the
+   * scope is only disposed once all of them have finalized.
+   */
+  finalize(): void {
+    if (this.#finalized) return;
+    this.#finalized = true;
+    this.#state.release(false, []);
+  }
+
+  [Symbol.dispose](): void {
+    this.finalize();
+  }
+
+  /**
+   * Promotes the header + retained tail above the static region before
+   * clearing it. Called when the command errored so the user has visible
+   * context. When multiple writers share a scope, any writer finalizing
+   * for error causes the shared region to use the error path once all
+   * writers have finalized.
+   */
+  finalizeForError(): void {
+    if (this.#finalized) return;
+    this.#finalized = true;
+    const trailing: string[] = [];
+    if (this.#pending.length > 0) {
+      trailing.push(stripTrailingCR(this.#pending));
+      this.#pending = "";
+    }
+    this.#state.release(true, trailing);
+  }
+}
+
+function stripTrailingCR(line: string): string {
+  return line.endsWith("\r") ? line.slice(0, -1) : line;
+}
+
+function isStderrTty(): boolean {
+  return Boolean((process.stderr as { isTTY?: boolean }).isTTY);
+}
+
+/**
+ * Header rendered above the live tail while the command is in flight:
+ * `Running <command>` in bold cyan.
+ */
+export function formatTailHeader(text: string, size: ConsoleSize | undefined): string {
+  return renderTailHeader(text, size, "Running", colors.cyan);
+}
+
+/**
+ * Past-tense header promoted to scrollback when a tailed command completes
+ * successfully: `Ran <command>` in bold green.
+ */
+export function formatRanHeader(text: string, size: ConsoleSize | undefined): string {
+  return renderTailHeader(text, size, "Ran", colors.green);
+}
+
+function renderTailHeader(
+  text: string,
+  size: ConsoleSize | undefined,
+  status: string,
+  statusColor: (s: string) => string,
+): string {
+  const maxColumns = size?.columns ?? 80;
+  // <status> <text> — overhead is status + separating space
+  const overhead = status.length + 1;
+  const budget = Math.max(10, maxColumns - overhead);
+  const display = text.length > budget ? text.slice(0, budget - 1) + "…" : text;
+  return `${colors.bold(statusColor(status))} ${display}`;
 }
 
 export interface PipedBufferListener extends WriterSync, Closer {

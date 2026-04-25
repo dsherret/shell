@@ -13,11 +13,7 @@ export {
 } from "./src/command.ts";
 export {
   Box,
-  hasStaticText,
   LoggerTreeBox,
-  setHasStaticText,
-  setStaticTextClear,
   symbols,
   TreeBox,
-  withStaticTextClear,
 } from "./src/common.ts";

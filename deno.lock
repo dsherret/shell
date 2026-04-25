@@ -1,6 +1,7 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@david/console-static-text@~0.3.4": "0.3.4",
     "jsr:@david/dax@0.39.2": "0.39.2",
     "jsr:@david/dax@0.41.0": "0.41.0",
     "jsr:@david/path@0.3": "0.3.2",
@@ -34,6 +35,9 @@
     "jsr:@std/streams@0.221.0": "0.221.0"
   },
   "jsr": {
+    "@david/console-static-text@0.3.4": {
+      "integrity": "1c596f500b075ff3c8bab1d328ca7148a88067fd9a506b16a73eeaf230c229fd"
+    },
     "@david/dax@0.39.2": {
       "integrity": "f7fde219e9a4b331024bcc89bfc5c63b85348cad61ff26a963d893262d92b01c",
       "dependencies": [
@@ -174,6 +178,7 @@
   },
   "workspace": {
     "dependencies": [
+      "jsr:@david/console-static-text@~0.3.4",
       "jsr:@david/path@0.3",
       "jsr:@david/temp@~0.2.1",
       "jsr:@david/which@0.6",
