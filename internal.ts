@@ -11,9 +11,4 @@ export {
   template,
   templateRaw,
 } from "./src/command.ts";
-export {
-  Box,
-  LoggerTreeBox,
-  symbols,
-  TreeBox,
-} from "./src/common.ts";
+export { Box, LoggerTreeBox, symbols, TreeBox } from "./src/common.ts";

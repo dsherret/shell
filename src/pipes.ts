@@ -1,5 +1,13 @@
 import type { FsFileWrapper, Path } from "@david/path";
-import { type ConsoleSize, renderInterval, staticText, type TextItem } from "@david/console-static-text";
+import {
+  type ConsoleSize,
+  type RenderInterval,
+  renderInterval,
+  staticText,
+  type StaticTextContainer,
+  type StaticTextScope,
+  type TextItem,
+} from "@david/console-static-text";
 import * as colors from "@std/fmt/colors";
 import { Buffer } from "@std/io/buffer";
 import { writeAll, writeAllSync } from "@std/io/write-all";
@@ -10,24 +18,6 @@ import type { Closer, Reader, ReaderSync, Writer, WriterSync } from "@std/io/typ
 import type { CommandPipeWriter } from "./command_handler.ts";
 export type { Closer, Reader, ReaderSync, Writer, WriterSync };
 
-// keep the shared render loop alive while shell is loaded so that our
-// tail-display scope (and other static text from the host) gets painted.
-const _renderScope: Disposable = renderInterval.start();
-const tailScope = staticText.createScope();
-const activeTailSegments: InheritTailState[] = [];
-
-function _renderTailScope(): void {
-  const items: TextItem[] = [];
-  for (const seg of activeTailSegments) {
-    if (seg.header != null) {
-      const header = seg.header;
-      items.push((size) => formatTailHeader(header, size));
-    }
-    for (const line of seg.lines.takeLast(seg.maxLines)) items.push(indentTailLine(line));
-  }
-  tailScope.setText(items);
-}
-
 /** 2-space indent for tail output, mirrors Docker's nested step output. */
 const TAIL_INDENT = "  ";
 
@@ -37,6 +27,69 @@ const TAIL_INDENT = "  ";
 function indentTailLine(line: string): TextItem {
   return { text: TAIL_INDENT + line, hangingIndent: TAIL_INDENT.length };
 }
+
+/**
+ * Owns the static text scope and the list of active tail segments. A single
+ * shared instance handles all `InheritTailWriter`s in the process so parallel
+ * commands interleave into the same pinned region. Tests can construct
+ * their own with a stand-in `StaticTextContainer` to assert on the emitted
+ * ANSI bytes; pass `interval: null` to skip the periodic refresh and drive
+ * `container.refresh()` manually.
+ */
+export class TailRenderer implements Disposable {
+  readonly container: StaticTextContainer;
+  readonly #scope: StaticTextScope;
+  readonly #intervalScope: Disposable | undefined;
+  readonly #segments: InheritTailState[] = [];
+
+  constructor(options: {
+    container?: StaticTextContainer;
+    interval?: RenderInterval | null;
+  } = {}) {
+    this.container = options.container ?? staticText;
+    this.#scope = this.container.createScope();
+    const interval = options.interval === null ? undefined : (options.interval ?? renderInterval);
+    this.#intervalScope = interval?.start();
+  }
+
+  [Symbol.dispose](): void {
+    this.#intervalScope?.[Symbol.dispose]();
+    this.#scope[Symbol.dispose]();
+  }
+
+  /** @internal */
+  register(seg: InheritTailState): void {
+    this.#segments.push(seg);
+  }
+
+  /** @internal */
+  unregister(seg: InheritTailState): void {
+    const idx = this.#segments.indexOf(seg);
+    if (idx !== -1) this.#segments.splice(idx, 1);
+  }
+
+  /** @internal */
+  refresh(): void {
+    const items: TextItem[] = [];
+    for (const seg of this.#segments) {
+      if (seg.header != null) {
+        const header = seg.header;
+        items.push((size) => formatTailHeader(header, size));
+      }
+      for (const line of seg.lines.takeLast(seg.maxLines)) items.push(indentTailLine(line));
+    }
+    this.#scope.setText(items);
+  }
+
+  /** @internal */
+  logAbove(items: TextItem[]): void {
+    this.#scope.logAbove(items);
+  }
+}
+
+/** Default renderer wired to the host's stderr-backed `staticText` global
+ * and the shared `renderInterval` so the pinned region keeps painting. */
+const defaultTailRenderer: TailRenderer = new TailRenderer();
 
 const encoder = new TextEncoder();
 
@@ -242,7 +295,15 @@ class InheritTailState {
   #registered = false;
   #totalLinesSeen = 0;
 
-  constructor(maxLines: number, isTty: boolean, maxErrorLines: number = DEFAULT_INHERIT_TAIL_ERROR_LINES) {
+  readonly renderer: TailRenderer;
+
+  constructor(
+    renderer: TailRenderer,
+    maxLines: number,
+    isTty: boolean,
+    maxErrorLines: number = DEFAULT_INHERIT_TAIL_ERROR_LINES,
+  ) {
+    this.renderer = renderer;
     this.maxLines = Math.max(1, maxLines);
     // one ring sized to the larger error budget; the live tail is just the
     // last `maxLines` slice of it, so no separate small buffer needed.
@@ -257,7 +318,7 @@ class InheritTailState {
   addRef(): void {
     this.#refCount++;
     if (this.enabled && !this.#registered && !this.#disposed) {
-      activeTailSegments.push(this);
+      this.renderer.register(this);
       this.#registered = true;
     }
   }
@@ -277,7 +338,7 @@ class InheritTailState {
 
   #render(): void {
     if (!this.enabled || this.#disposed) return;
-    _renderTailScope();
+    this.renderer.refresh();
   }
 
   release(errored: boolean, trailing: string[]): void {
@@ -289,9 +350,8 @@ class InheritTailState {
     this.#disposed = true;
     if (!this.enabled) return;
     this.#flushAbove();
-    const idx = activeTailSegments.indexOf(this);
-    if (idx !== -1) activeTailSegments.splice(idx, 1);
-    _renderTailScope();
+    this.renderer.unregister(this);
+    this.renderer.refresh();
   }
 
   #flushAbove(): void {
@@ -319,9 +379,8 @@ class InheritTailState {
       const header = this.header;
       preserved.push((size) => formatRanHeader(header, size));
     }
-    if (preserved.length > 0) tailScope.logAbove(preserved);
+    if (preserved.length > 0) this.renderer.logAbove(preserved);
   }
-
 }
 
 /**
@@ -348,16 +407,17 @@ export class InheritTailWriter implements WriterSync, Disposable {
   #pending = "";
   #finalized = false;
 
-  constructor(innerWriter: WriterSync, maxLines?: number, isTty?: boolean);
+  constructor(innerWriter: WriterSync, maxLines?: number, isTty?: boolean, renderer?: TailRenderer);
   constructor(innerWriter: WriterSync, sibling: InheritTailWriter);
   constructor(
     innerWriter: WriterSync,
     maxLinesOrSibling: number | InheritTailWriter = DEFAULT_INHERIT_TAIL_LINES,
     isTty: boolean = isStderrTty(),
+    renderer: TailRenderer = defaultTailRenderer,
   ) {
     this.#innerWriter = innerWriter;
     if (typeof maxLinesOrSibling === "number") {
-      this.#state = new InheritTailState(maxLinesOrSibling, isTty);
+      this.#state = new InheritTailState(renderer, maxLinesOrSibling, isTty);
     } else {
       this.#state = maxLinesOrSibling.#state;
     }

@@ -1,15 +1,53 @@
 import { assertEquals, assertStringIncludes } from "@std/assert";
 import { stripAnsiCode } from "@std/fmt/colors";
 import { Buffer } from "@std/io/buffer";
+import { StaticTextContainer } from "@david/console-static-text";
 import {
   formatRanHeader,
   formatTailHeader,
   InheritStaticTextBypassWriter,
   InheritTailWriter,
+  TailRenderer,
 } from "./pipes.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+/**
+ * Spins up a `TailRenderer` backed by a captured-writes `StaticTextContainer`
+ * with a fixed console size so tests can assert on the exact ANSI bytes
+ * `InheritTailWriter` ends up emitting. The interval is disabled — tests
+ * call `flush()` to force `container.refresh()` whenever they want to
+ * snapshot the written output.
+ */
+interface TailFixture extends Disposable {
+  readonly renderer: TailRenderer;
+  /** Refresh, then return captured output with ANSI color codes stripped. */
+  flushPlain(): string;
+}
+
+function createTailFixture(opts: { rows: number; columns: number }): TailFixture {
+  let written = "";
+  const container = new StaticTextContainer(
+    (text) => {
+      written += text;
+    },
+    () => ({ rows: opts.rows, columns: opts.columns }),
+  );
+  const renderer = new TailRenderer({ container, interval: null });
+  return {
+    renderer,
+    flushPlain() {
+      container.refresh();
+      const out = stripAnsiCode(written);
+      written = "";
+      return out;
+    },
+    [Symbol.dispose]() {
+      renderer[Symbol.dispose]();
+    },
+  };
+}
 
 Deno.test("should line buffer the inherit static text bypass writer", () => {
   const buffer = new Buffer();
@@ -160,4 +198,70 @@ Deno.test("sibling writers don't dispose the shared scope until both finalize", 
   stderr.writeSync(encoder.encode("still here\n"));
   assertEquals(stderr.tailLines, ["shared", "still here"]);
   stderr.finalize();
+});
+
+Deno.test("tail rendering: live pinned region shows Running header above indented output", () => {
+  using fixture = createTailFixture({ rows: 20, columns: 60 });
+  using writer = new InheritTailWriter(new Buffer(), 5, /*isTty*/ true, fixture.renderer);
+  writer.setHeader("echo hello");
+  writer.writeSync(encoder.encode("hello\nworld\n"));
+
+  const out = fixture.flushPlain();
+  assertStringIncludes(out, "Running echo hello");
+  assertStringIncludes(out, "  hello");
+  assertStringIncludes(out, "  world");
+});
+
+Deno.test("tail rendering: success without printCommand clears silently", () => {
+  using fixture = createTailFixture({ rows: 20, columns: 60 });
+  using writer = new InheritTailWriter(new Buffer(), 5, /*isTty*/ true, fixture.renderer);
+  writer.setHeader("echo hello");
+  writer.writeSync(encoder.encode("hello\n"));
+  fixture.flushPlain(); // discard live-tail draw
+
+  writer.finalize();
+  // promoteHeaderOnSuccess defaults to false → nothing scrollback-promoted,
+  // pinned region is just cleared. content is empty after stripping ANSI.
+  assertEquals(fixture.flushPlain().trim(), "");
+});
+
+Deno.test("tail rendering: success with promoteHeaderOnSuccess writes Ran header to scrollback", () => {
+  using fixture = createTailFixture({ rows: 20, columns: 60 });
+  using writer = new InheritTailWriter(new Buffer(), 5, /*isTty*/ true, fixture.renderer);
+  writer.setHeader("echo hello");
+  writer.setPromoteHeaderOnSuccess(true);
+  writer.writeSync(encoder.encode("hello\n"));
+  fixture.flushPlain();
+
+  writer.finalize();
+  assertStringIncludes(fixture.flushPlain(), "Ran echo hello");
+});
+
+Deno.test("tail rendering: error path emits > header and retained tail above pinned region", () => {
+  using fixture = createTailFixture({ rows: 40, columns: 60 });
+  using writer = new InheritTailWriter(new Buffer(), 3, /*isTty*/ true, fixture.renderer);
+  writer.setHeader("./build.sh");
+  writer.writeSync(encoder.encode("compiling…\nlinking…\nboom\n"));
+  fixture.flushPlain();
+
+  writer.finalizeForError();
+  const out = fixture.flushPlain();
+  // command header (the `> <cmd>` form, regardless of printCommand)
+  assertStringIncludes(out, "> ./build.sh");
+  // retained tail under it, indented
+  assertStringIncludes(out, "  compiling…");
+  assertStringIncludes(out, "  linking…");
+  assertStringIncludes(out, "  boom");
+});
+
+Deno.test("tail rendering: error path includes omitted-lines marker when ring overflows", () => {
+  using fixture = createTailFixture({ rows: 200, columns: 60 });
+  using writer = new InheritTailWriter(new Buffer(), 3, /*isTty*/ true, fixture.renderer);
+  writer.setHeader("./big.sh");
+  // 100 lines written, 80 retained → 20 dropped → "...20 lines omitted..."
+  for (let i = 1; i <= 100; i++) writer.writeSync(encoder.encode(`l${i}\n`));
+  fixture.flushPlain();
+
+  writer.finalizeForError();
+  assertStringIncludes(fixture.flushPlain(), "...20 lines omitted...");
 });
