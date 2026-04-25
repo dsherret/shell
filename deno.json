@@ -25,6 +25,14 @@
       ]
     }
   },
+  "publish": {
+    "exclude": [
+      "src/rs_lib",
+      "src/test",
+      "**/*.test.*",
+      "dprint.json"
+    ]
+  },
   "exclude": [
     ".gitattributes",
     ".gitignore",
@@ -33,11 +41,7 @@
     ".vscode",
     "Cargo.toml",
     "Cargo.lock",
-    "target/",
-    "src/rs_lib",
-    "src/test",
-    "dprint.json",
-    "**/*.test.*"
+    "target/"
   ],
   "exports": {
     ".": "./mod.ts",
