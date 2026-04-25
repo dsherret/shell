@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import { Readable } from "node:stream";
-import { writeSyncAll } from "./fs_file.ts";
+import { writeSyncAll } from "./fsFile.ts";
 
 export interface Stdin {
   read(p: Uint8Array): Promise<number | null>;

@@ -13,9 +13,9 @@ import { Buffer } from "@std/io/buffer";
 import { writeAll, writeAllSync } from "@std/io/write-all";
 import type { CommandBuilder, KillSignal } from "./command.ts";
 import { abortSignalToPromise } from "./common.ts";
-import { LineRingBuffer } from "./line_ring_buffer.ts";
+import { LineRingBuffer } from "./lineRingBuffer.ts";
 import type { Closer, Reader, ReaderSync, Writer, WriterSync } from "@std/io/types";
-import type { CommandPipeWriter } from "./command_handler.ts";
+import type { CommandPipeWriter } from "./commandHandler.ts";
 export type { Closer, Reader, ReaderSync, Writer, WriterSync };
 
 /** 2-space indent for tail output, mirrors Docker's nested step output. */
@@ -41,6 +41,11 @@ export class TailRenderer implements Disposable {
   readonly #scope: StaticTextScope;
   readonly #intervalScope: Disposable | undefined;
   readonly #segments: InheritTailState[] = [];
+  // single deferred installed on the scope while at least one segment is
+  // active. `setText` is called only on the empty↔non-empty transition, so
+  // appendLines/setHeader become pure field writes — items get rebuilt at
+  // draw time (≈16 Hz via renderInterval) instead of per write.
+  readonly #deferredItems: TextItem[];
 
   constructor(options: {
     container?: StaticTextContainer;
@@ -50,6 +55,7 @@ export class TailRenderer implements Disposable {
     this.#scope = this.container.createScope();
     const interval = options.interval === null ? undefined : (options.interval ?? renderInterval);
     this.#intervalScope = interval?.start();
+    this.#deferredItems = [(size) => this.#buildItems(size)];
   }
 
   [Symbol.dispose](): void {
@@ -59,31 +65,38 @@ export class TailRenderer implements Disposable {
 
   /** @internal */
   register(seg: InheritTailState): void {
+    const wasEmpty = this.#segments.length === 0;
     this.#segments.push(seg);
+    // flip the scope on only when transitioning from no segments → some,
+    // so `hasText()` toggles and the renderInterval can park itself when
+    // nothing is being tailed.
+    if (wasEmpty) this.#scope.setText(this.#deferredItems);
   }
 
   /** @internal */
   unregister(seg: InheritTailState): void {
     const idx = this.#segments.indexOf(seg);
     if (idx !== -1) this.#segments.splice(idx, 1);
-  }
-
-  /** @internal */
-  refresh(): void {
-    const items: TextItem[] = [];
-    for (const seg of this.#segments) {
-      if (seg.header != null) {
-        const header = seg.header;
-        items.push((size) => formatTailHeader(header, size));
-      }
-      for (const line of seg.lines.takeLast(seg.maxLines)) items.push(indentTailLine(line));
-    }
-    this.#scope.setText(items);
+    if (this.#segments.length === 0) this.#scope.setText([]);
   }
 
   /** @internal */
   logAbove(items: TextItem[]): void {
     this.#scope.logAbove(items);
+  }
+
+  #buildItems(size: ConsoleSize | undefined): TextItem[] {
+    const items: TextItem[] = [];
+    for (const seg of this.#segments) {
+      // headers used to be emitted as `(size) => formatTailHeader(...)`
+      // closures so they could re-fit on console-size changes — but the
+      // deferred item we register on the scope already runs per draw, so
+      // we compute the header string inline here and skip a closure per
+      // segment per tick.
+      if (seg.header != null) items.push(formatTailHeader(seg.header, size));
+      for (const line of seg.lines.takeLast(seg.maxLines)) items.push(indentTailLine(line));
+    }
+    return items;
   }
 }
 
@@ -327,19 +340,15 @@ class InheritTailState {
   setHeader(text: string | undefined): void {
     const trimmed = text == null ? undefined : text.replace(/\s+/g, " ").trim();
     this.header = trimmed && trimmed.length > 0 ? trimmed : undefined;
-    this.#render();
+    // no explicit redraw — the renderer's deferred items pick up the new
+    // header on the next tick.
   }
 
   appendLines(newLines: string[]): void {
     if (this.#disposed) return;
     this.#totalLinesSeen += newLines.length;
     for (const line of newLines) this.lines.push(line);
-    this.#render();
-  }
-
-  #render(): void {
-    if (!this.enabled || this.#disposed) return;
-    this.renderer.refresh();
+    // ditto: drawing is driven by the renderInterval, not per-write.
   }
 
   release(errored: boolean, trailing: string[]): void {
@@ -350,9 +359,12 @@ class InheritTailState {
     if (this.#refCount > 0) return;
     this.#disposed = true;
     if (!this.enabled) return;
-    this.#flushAbove();
+    // unregister before flushAbove so this segment is gone from the live
+    // tail by the time logAbove's internal refresh redraws — otherwise the
+    // just-finalized command would briefly re-appear under the preserved
+    // scrollback content.
     this.renderer.unregister(this);
-    this.renderer.refresh();
+    this.#flushAbove();
   }
 
   #flushAbove(): void {

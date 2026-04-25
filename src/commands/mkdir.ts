@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import type { CommandContext } from "../command_handler.ts";
+import type { CommandContext } from "../commandHandler.ts";
 import { errorToString, resolvePath } from "../common.ts";
 import { safeLstat } from "../common.ts";
 import type { ExecuteResult } from "../result.ts";

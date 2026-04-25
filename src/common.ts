@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { staticText } from "@david/console-static-text";
-import { open } from "./fs_file.ts";
+import { open } from "./fsFile.ts";
 import type { Reader } from "./pipes.ts";
 
 export const isWindows: boolean = process.platform === "win32";

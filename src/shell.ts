@@ -1,10 +1,10 @@
 import * as path from "node:path";
 import { RealEnvironment, which } from "which";
 import type { KillSignal } from "./command.ts";
-import type { CommandContext, CommandHandler, CommandPipeReader } from "./command_handler.ts";
+import type { CommandContext, CommandHandler, CommandPipeReader } from "./commandHandler.ts";
 import { createExecutableCommand } from "./commands/executable.ts";
 import { errorToString, getExecutableShebangFromPath, getRealEnvVars, isWindows, type ShebangInfo } from "./common.ts";
-import { open } from "./fs_file.ts";
+import { open } from "./fsFile.ts";
 import { expandGlob } from "./glob.ts";
 import * as wasmInstance from "./lib/rs_lib.js";
 import {

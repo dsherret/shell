@@ -1,5 +1,5 @@
 import { assertEquals } from "@std/assert";
-import { LineRingBuffer } from "./line_ring_buffer.ts";
+import { LineRingBuffer } from "./lineRingBuffer.ts";
 
 Deno.test("empty buffer reports zero size and yields nothing", () => {
   const buf = new LineRingBuffer(5);
