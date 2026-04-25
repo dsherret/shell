@@ -97,10 +97,6 @@ export type PipeReader = Reader | ReaderSync;
 
 export type PipeWriter = Writer | WriterSync;
 
-/** Behaviour to use for stdin.
- * @value "inherit" - Sends the stdin of the process to the shell (default).
- * @value "null" - Does not pipe or redirect the pipe.
- */
 /** An awaitable that resolves to an object exposing a `readable` stream —
  * e.g. a `RequestBuilder` that resolves to a response with `.readable`. */
 export interface AwaitableReadable {
@@ -113,6 +109,10 @@ export interface AwaitableReadable {
   ): PromiseLike<TResult1 | TResult2>;
 }
 
+/** Behaviour to use for stdin.
+ * @value "inherit" - Sends the stdin of the process to the shell (default).
+ * @value "null" - Does not pipe or redirect the pipe.
+ */
 export type ShellPipeReaderKind =
   | "inherit"
   | "null"
@@ -123,6 +123,7 @@ export type ShellPipeReaderKind =
   | FsFileWrapper
   | Path
   | AwaitableReadable;
+
 /**
  * The behaviour to use for a shell pipe.
  * @value "inherit" - Sends the output directly to the current process' corresponding pipe (default).

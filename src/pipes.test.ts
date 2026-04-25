@@ -49,6 +49,14 @@ function createTailFixture(opts: { rows: number; columns: number }): TailFixture
   };
 }
 
+/** Renderer that drops every byte. Used by tests that don't care about
+ * rendered output but still need an isolated renderer so `InheritTailWriter`
+ * doesn't leak ANSI escapes to the real terminal via the global default. */
+function createNoopRenderer(): TailRenderer {
+  const container = new StaticTextContainer(() => {}, () => ({ rows: 24, columns: 80 }));
+  return new TailRenderer({ container, interval: null });
+}
+
 Deno.test("should line buffer the inherit static text bypass writer", () => {
   const buffer = new Buffer();
   const writer = new InheritStaticTextBypassWriter(buffer);
@@ -68,7 +76,8 @@ Deno.test("should line buffer the inherit static text bypass writer", () => {
 
 Deno.test("inherit tail writer keeps only the last N completed lines", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true, renderer);
   writer.writeSync(encoder.encode("line1\nline2\nline3\nline4\nline5\n"));
   assertEquals(writer.tailLines, ["line3", "line4", "line5"]);
   // scope owns the output; inner buffer should remain empty in TTY mode
@@ -77,7 +86,8 @@ Deno.test("inherit tail writer keeps only the last N completed lines", () => {
 
 Deno.test("inherit tail writer handles partial writes split across chunks", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 5, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 5, /*isTty*/ true, renderer);
   writer.writeSync(encoder.encode("hel"));
   writer.writeSync(encoder.encode("lo\nwor"));
   assertEquals(writer.tailLines, ["hello"]);
@@ -87,14 +97,16 @@ Deno.test("inherit tail writer handles partial writes split across chunks", () =
 
 Deno.test("inherit tail writer strips trailing \\r from \\r\\n line endings", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 5, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 5, /*isTty*/ true, renderer);
   writer.writeSync(encoder.encode("a\r\nb\r\n"));
   assertEquals(writer.tailLines, ["a", "b"]);
 });
 
 Deno.test("inherit tail writer falls back to direct inherit when not a TTY", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ false);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ false, renderer);
   writer.writeSync(encoder.encode("line1\nline2\n"));
   assertEquals(decoder.decode(buffer.bytes()), "line1\nline2\n");
   assertEquals(writer.tailLines, []);
@@ -102,7 +114,8 @@ Deno.test("inherit tail writer falls back to direct inherit when not a TTY", () 
 
 Deno.test("inherit tail writer stops accepting writes after finalize", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true, renderer);
   writer.writeSync(encoder.encode("before\n"));
   writer.finalize();
   // writes after finalize are no-ops
@@ -112,7 +125,8 @@ Deno.test("inherit tail writer stops accepting writes after finalize", () => {
 
 Deno.test("inherit tail writer keeps a larger error buffer than the live tail", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true, renderer);
   // live tail is bounded by maxLines (3), but the underlying ring retains
   // the last 80 so `finalizeForError` can promote meaningful context back
   // to scrollback. `omittedLineCount` surfaces how many lines rolled off.
@@ -125,7 +139,8 @@ Deno.test("inherit tail writer keeps a larger error buffer than the live tail", 
 
 Deno.test("inherit tail writer reports zero omitted lines when all lines fit", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true, renderer);
   for (let i = 1; i <= 5; i++) writer.writeSync(encoder.encode(`line${i}\n`));
   assertEquals(writer.omittedLineCount, 0);
 });
@@ -149,7 +164,8 @@ Deno.test("ran header replaces the running header on success scrollback", () => 
 
 Deno.test("tail header flattens whitespace (multiline commands stay on one line)", () => {
   const buffer = new Buffer();
-  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using writer = new InheritTailWriter(buffer, 3, /*isTty*/ true, renderer);
   writer.setHeader("deno eval\n  const x = 1;\n  console.log(x);");
   // setHeader strips the ANSI-free raw, no tailLines assertion since header is
   // a DeferredItem rendered on refresh — but setHeader should not throw and
@@ -161,7 +177,8 @@ Deno.test("tail header flattens whitespace (multiline commands stay on one line)
 Deno.test("sibling inherit tail writers share one scrolling region", () => {
   const stdoutBuf = new Buffer();
   const stderrBuf = new Buffer();
-  using stdout = new InheritTailWriter(stdoutBuf, 4, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using stdout = new InheritTailWriter(stdoutBuf, 4, /*isTty*/ true, renderer);
   using stderr = new InheritTailWriter(stderrBuf, stdout);
   // both tailLines getters point at the same shared array
   assertEquals(stdout.tailLines, stderr.tailLines);
@@ -176,7 +193,8 @@ Deno.test("sibling inherit tail writers share one scrolling region", () => {
 Deno.test("sibling inherit tail writers keep separate pending buffers", () => {
   const stdoutBuf = new Buffer();
   const stderrBuf = new Buffer();
-  using stdout = new InheritTailWriter(stdoutBuf, 10, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  using stdout = new InheritTailWriter(stdoutBuf, 10, /*isTty*/ true, renderer);
   using stderr = new InheritTailWriter(stderrBuf, stdout);
   // interleaved partial writes shouldn't cross-contaminate — each writer
   // only promotes its own pending bytes to a completed line.
@@ -190,7 +208,8 @@ Deno.test("sibling inherit tail writers keep separate pending buffers", () => {
 Deno.test("sibling writers don't dispose the shared scope until both finalize", () => {
   const stdoutBuf = new Buffer();
   const stderrBuf = new Buffer();
-  const stdout = new InheritTailWriter(stdoutBuf, 4, /*isTty*/ true);
+  using renderer = createNoopRenderer();
+  const stdout = new InheritTailWriter(stdoutBuf, 4, /*isTty*/ true, renderer);
   const stderr = new InheritTailWriter(stderrBuf, stdout);
   stdout.writeSync(encoder.encode("shared\n"));
   stdout.finalize();
