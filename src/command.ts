@@ -965,10 +965,13 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
   // label active tail scrolling regions with the command text so it's
   // obvious which command the tail belongs to, especially when running
-  // commands in parallel. on finalize the header is promoted to scrollback
-  // so "which commands ran" is still visible after the tail clears.
+  // commands in parallel. success-path promotion of the `Ran <cmd>` line
+  // is gated on `.printCommand()` — without that opt-in the live tail
+  // clears silently on success. the error path always promotes the header
+  // plus retained context regardless.
   for (const tw of tailWriters) {
     tw.setHeader(state.command.text);
+    tw.setPromoteHeaderOnSuccess(Boolean(state.printCommand));
   }
   // when tailDisplay is on for an `"inherit"` stream we need Node's spawn
   // to pipe the child's output through us instead of connecting the child

@@ -311,7 +311,11 @@ class InheritTailState {
       }
       for (const line of this.lines) preserved.push(indentTailLine(line));
       for (const line of this.#trailingLines) preserved.push(indentTailLine(line));
-    } else if (this.header != null) {
+    } else if (this.promoteHeaderOnSuccess && this.header != null) {
+      // `Ran <cmd>` on success mirrors what `.printCommand()` would print
+      // upfront, so only promote it when the caller asked for the command
+      // to be visible in the host's scrollback. Without that opt-in, the
+      // live tail clears silently.
       const header = this.header;
       preserved.push((size) => formatRanHeader(header, size));
     }
@@ -380,6 +384,18 @@ export class InheritTailWriter implements WriterSync, Disposable {
    */
   setHeader(text: string | undefined): void {
     this.#state.setHeader(text);
+  }
+
+  /**
+   * Controls whether the `Ran <command>` header is promoted to scrollback
+   * on successful finalize. Defaults to `false` — on success the live tail
+   * clears silently unless the caller opts in (command.ts enables it when
+   * `.printCommand()` was set, so the command stays visible in scrollback).
+   * The error-path header (`> <command>` + retained tail) is always emitted
+   * regardless of this flag since it's diagnostic.
+   */
+  setPromoteHeaderOnSuccess(value: boolean): void {
+    this.#state.promoteHeaderOnSuccess = value;
   }
 
   writeSync(p: Uint8Array): number {
