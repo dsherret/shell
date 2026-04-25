@@ -35,11 +35,6 @@
     "Cargo.lock",
     "target/"
   ],
-  "publish": {
-    "exclude": [
-      "examples/"
-    ]
-  },
   "exports": {
     ".": "./mod.ts",
     "./internal": "./internal.ts"
