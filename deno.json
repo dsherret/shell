@@ -33,7 +33,11 @@
     ".vscode",
     "Cargo.toml",
     "Cargo.lock",
-    "target/"
+    "target/",
+    "src/rs_lib",
+    "src/test",
+    "dprint.json",
+    "**/*.test.*"
   ],
   "exports": {
     ".": "./mod.ts",
