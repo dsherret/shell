@@ -6,8 +6,10 @@ export {
   KillController,
   KillSignal,
   type KillSignalListener,
+  type NonRedirectTemplateExpr,
   RawArg,
   rawArg,
+  type StreamKind,
   type TemplateExpr,
 } from "./src/command.ts";
 export type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "./src/commandHandler.ts";
@@ -47,4 +49,4 @@ export { create, FsFile, open, type OpenOptions, type WriteFileOptions } from ".
 export type { Signal } from "./src/signal.ts";
 export { type Delay, delayToMs } from "./src/common.ts";
 export type { ConsoleSize } from "@david/console-static-text";
-export { Path } from "@david/path";
+export { FsFileWrapper, Path } from "@david/path";

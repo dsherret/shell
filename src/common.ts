@@ -70,6 +70,7 @@ export type Delay =
   | `${number}h${number}m`
   | `${number}h${number}m${number}s`;
 
+/** Converts a {@link Delay} value into the equivalent number of milliseconds. */
 export function delayToMs(delay: Delay): number {
   if (typeof delay === "number") {
     return delay;

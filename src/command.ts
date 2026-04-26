@@ -56,7 +56,10 @@ import { parseCommand, type ShellOptionsState, spawn } from "./shell.ts";
 import { StreamFds } from "./shell.ts";
 
 type BufferStdio = "inherit" | "null" | "streamed" | Buffer;
-type StreamKind = "stdout" | "stderr" | "combined";
+
+/** Identifies one of the standard output streams of a command, or both
+ * of them when combined. */
+export type StreamKind = "stdout" | "stderr" | "combined";
 
 class Deferred<T> {
   #create: () => T | Promise<T>;
@@ -221,6 +224,10 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     return builder;
   }
 
+  /** Spawns the command and returns a promise resolving to the command result.
+   *
+   * Allows awaiting a `CommandBuilder` directly without calling `.spawn()`.
+   */
   then<TResult1 = CommandResult, TResult2 = never>(
     onfulfilled?: ((value: CommandResult) => TResult1 | PromiseLike<TResult1>) | null | undefined,
     onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null | undefined,
@@ -390,6 +397,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
 
   /** Set the stdout kind. */
   stdout(kind: ShellPipeWriterKind): CommandBuilder;
+  /** Set the stdout to pipe to the provided WritableStream with optional pipe options. */
   stdout(kind: WritableStream<Uint8Array>, options?: StreamPipeOptions): CommandBuilder;
   stdout(kind: ShellPipeWriterKind, options?: StreamPipeOptions): CommandBuilder {
     return this.#newWithState((state) => {
@@ -411,6 +419,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
 
   /** Set the stderr kind. */
   stderr(kind: ShellPipeWriterKind): CommandBuilder;
+  /** Set the stderr to pipe to the provided WritableStream with optional pipe options. */
   stderr(kind: WritableStream<Uint8Array>, options?: StreamPipeOptions): CommandBuilder;
   stderr(kind: ShellPipeWriterKind, options?: StreamPipeOptions): CommandBuilder {
     return this.#newWithState((state) => {
@@ -455,6 +464,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * ```
    */
   tailDisplay(value?: boolean): CommandBuilder;
+  /** Enables Docker-style partial scrolling with the provided options. */
   tailDisplay(options: TailDisplayOptions): CommandBuilder;
   tailDisplay(valueOrOptions: boolean | TailDisplayOptions = true): CommandBuilder {
     return this.#newWithState((state) => {
@@ -847,6 +857,9 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
   }
 }
 
+/** A spawned command. Awaiting it resolves to a `CommandResult` and it
+ * exposes hooks to read piped output streams or send signals to the
+ * underlying child process. */
 export class CommandChild extends Promise<CommandResult> {
   #pipedStdoutBuffer: PipedBuffer | "consumed" | undefined;
   #pipedStderrBuffer: PipedBuffer | "consumed" | undefined;
@@ -875,6 +888,8 @@ export class CommandChild extends Promise<CommandResult> {
     this.#killSignalController?.kill(signal);
   }
 
+  /** Returns a `ReadableStream` of the running child's stdout. Requires the
+   * stdout to have been set to `"piped"`. May only be consumed once. */
   stdout(): ReadableStream<Uint8Array> {
     const buffer = this.#pipedStdoutBuffer;
     this.#assertBufferStreamable("stdout", buffer);
@@ -885,6 +900,8 @@ export class CommandChild extends Promise<CommandResult> {
     return this.#bufferToStream(buffer);
   }
 
+  /** Returns a `ReadableStream` of the running child's stderr. Requires the
+   * stderr to have been set to `"piped"`. May only be consumed once. */
   stderr(): ReadableStream<Uint8Array> {
     const buffer = this.#pipedStderrBuffer;
     this.#assertBufferStreamable("stderr", buffer);
@@ -1457,6 +1474,7 @@ function buildEnv(env: Record<string, string | undefined>, clearEnv: boolean) {
   return result;
 }
 
+/** Escapes a single argument for safe interpolation into a shell command. */
 export function escapeArg(arg: string): string {
   // very basic for now
   if (/^[A-Za-z0-9]+$/.test(arg)) {
@@ -1466,18 +1484,24 @@ export function escapeArg(arg: string): string {
   }
 }
 
+/** Wraps a value so that it is interpolated into a template literal command
+ * without being shell-escaped. Use {@link rawArg} to construct one. */
 export class RawArg<T> {
   #value: T;
 
+  /** Creates a new `RawArg` wrapping the provided value. */
   constructor(value: T) {
     this.#value = value;
   }
 
+  /** The wrapped value that will be used as-is during template substitution. */
   get value(): T {
     return this.#value;
   }
 }
 
+/** Creates a `RawArg` wrapping the provided value so it bypasses shell
+ * argument escaping when interpolated into a template literal command. */
 export function rawArg<T>(arg: T): RawArg<T> {
   return new RawArg(arg);
 }
@@ -1508,6 +1532,7 @@ export class KillController {
     this.#killSignal = new KillSignal(SHELL_SIGNAL_CTOR_SYMBOL, this.#state);
   }
 
+  /** The associated `KillSignal` to attach to commands. */
   get signal(): KillSignal {
     return this.#killSignal;
   }
@@ -1571,10 +1596,12 @@ export class KillSignal {
     };
   }
 
+  /** Registers a listener that will be invoked whenever a signal is sent. */
   addListener(listener: KillSignalListener) {
     this.#state.listeners.push(listener);
   }
 
+  /** Removes a previously registered listener. */
   removeListener(listener: KillSignalListener) {
     const index = this.#state.listeners.indexOf(listener);
     if (index >= 0) {
@@ -1635,7 +1662,9 @@ export function templateRaw(strings: TemplateStringsArray, exprs: TemplateExpr[]
   return templateInner(strings, exprs, undefined);
 }
 
-type NonRedirectTemplateExpr =
+/** A template expression that can be substituted into a command outside of
+ * an input/output redirect context. */
+export type NonRedirectTemplateExpr =
   | string
   | number
   | boolean
@@ -1644,6 +1673,7 @@ type NonRedirectTemplateExpr =
   | CommandResult
   | RawArg<NonRedirectTemplateExpr>
   | { toString(): string; catch?: never };
+/** Any value that may be interpolated into a `$` template literal command. */
 export type TemplateExpr =
   | NonRedirectTemplateExpr
   | NonRedirectTemplateExpr[]
