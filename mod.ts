@@ -10,7 +10,7 @@ export {
   rawArg,
   type TemplateExpr,
 } from "./src/command.ts";
-export type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "./src/command_handler.ts";
+export type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "./src/commandHandler.ts";
 export {
   type AwaitableReadable,
   type Closer,
@@ -38,6 +38,6 @@ export { $, type $Base, type $Type, build$, type Create$Options } from "./src/do
 
 import { $ } from "./src/dollar.ts";
 export default $;
-export { create, FsFile, open, type OpenOptions, type WriteFileOptions } from "./src/fs_file.ts";
+export { create, FsFile, open, type OpenOptions, type WriteFileOptions } from "./src/fsFile.ts";
 export type { Signal } from "./src/signal.ts";
 export { type Delay, delayToMs } from "./src/common.ts";

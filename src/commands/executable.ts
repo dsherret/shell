@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "../command_handler.ts";
+import type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "../commandHandler.ts";
 import { errorToString } from "../common.ts";
 import {
   pipeReadableToWriterSync,

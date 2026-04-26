@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { open } from "./fs_file.ts";
+import { staticText } from "@david/console-static-text";
+import { open } from "./fsFile.ts";
 import type { Reader } from "./pipes.ts";
 
 export const isWindows: boolean = process.platform === "win32";
@@ -53,48 +54,6 @@ export const symbols: Symbols = {
   writable: Symbol.for("dax.writableStream"),
   readable: Symbol.for("dax.readableStream"),
 };
-
-/**
- * Hook installed by a host (e.g. dax) that maintains static terminal text
- * such as progress bars. When invoked, the host should temporarily clear
- * any static text, run the action (which will write to the terminal), then
- * restore the static text.
- *
- * Defaults to directly running the action. Call {@link setStaticTextClear}
- * to override.
- */
-let staticTextClear: (action: () => void) => void = (action) => action();
-
-/** Overrides the static text clear hook. See {@link staticTextClear}. */
-export function setStaticTextClear(fn: (action: () => void) => void): void {
-  staticTextClear = fn;
-}
-
-/** Invokes the static text clear hook installed by {@link setStaticTextClear}. */
-export function withStaticTextClear(action: () => void): void {
-  staticTextClear(action);
-}
-
-/**
- * Predicate installed by a host indicating that static terminal text is
- * currently being rendered (e.g. an active progress bar). Defaults to
- * `false`. Call {@link setHasStaticText} to override.
- *
- * When `true`, commands inheriting stdout/stderr will route through a
- * wrapper that calls {@link withStaticTextClear} before each write so
- * output doesn't get mangled.
- */
-let hasStaticTextFn: () => boolean = () => false;
-
-/** Overrides the static text predicate. See {@link hasStaticText}. */
-export function setHasStaticText(fn: () => boolean): void {
-  hasStaticTextFn = fn;
-}
-
-/** Returns whether the host is currently rendering static terminal text. */
-export function hasStaticText(): boolean {
-  return hasStaticTextFn();
-}
 
 /**
  * Delay used for certain actions.
@@ -198,7 +157,7 @@ export class LoggerTreeBox extends TreeBox<(...args: any[]) => void> {
   override getValue(): (...args: any[]) => void {
     const innerValue = super.getValue();
     return (...args: any[]) => {
-      return withStaticTextClear(() => {
+      return staticText.withTempClear(() => {
         innerValue(...args);
       });
     };

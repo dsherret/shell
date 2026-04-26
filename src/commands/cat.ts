@@ -1,6 +1,6 @@
-import type { CommandContext } from "../command_handler.ts";
+import type { CommandContext } from "../commandHandler.ts";
 import { errorToString, resolvePath } from "../common.ts";
-import { open } from "../fs_file.ts";
+import { open } from "../fsFile.ts";
 import type { ExecuteResult } from "../result.ts";
 import { bailUnsupported, parseArgKinds } from "./args.ts";
 

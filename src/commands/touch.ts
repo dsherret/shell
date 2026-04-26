@@ -1,7 +1,7 @@
 import { join } from "node:path";
-import type { CommandContext } from "../command_handler.ts";
+import type { CommandContext } from "../commandHandler.ts";
 import { errorToString } from "../common.ts";
-import { create } from "../fs_file.ts";
+import { create } from "../fsFile.ts";
 import { bailUnsupported, parseArgKinds } from "./args.ts";
 
 export async function touchCommand(context: CommandContext) {

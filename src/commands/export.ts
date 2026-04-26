@@ -1,4 +1,4 @@
-import type { CommandContext } from "../command_handler.ts";
+import type { CommandContext } from "../commandHandler.ts";
 import type { EnvChange, ExecuteResult } from "../result.ts";
 
 export function exportCommand(context: CommandContext): ExecuteResult {

@@ -1,7 +1,7 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { create, open } from "./fs_file.ts";
+import { create, open } from "./fsFile.ts";
 import { createTempDir } from "@david/temp";
 
 Deno.test("open: reads an existing file", async () => {

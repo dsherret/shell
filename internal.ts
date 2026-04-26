@@ -11,13 +11,4 @@ export {
   template,
   templateRaw,
 } from "./src/command.ts";
-export {
-  Box,
-  hasStaticText,
-  LoggerTreeBox,
-  setHasStaticText,
-  setStaticTextClear,
-  symbols,
-  TreeBox,
-  withStaticTextClear,
-} from "./src/common.ts";
+export { Box, LoggerTreeBox, symbols, TreeBox } from "./src/common.ts";
