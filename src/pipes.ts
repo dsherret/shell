@@ -6,6 +6,7 @@ import {
   staticText,
   type StaticTextContainer,
   type StaticTextScope,
+  stripAnsiCodes,
   type TextItem,
 } from "@david/console-static-text";
 import * as colors from "@std/fmt/colors";
@@ -87,14 +88,18 @@ export class TailRenderer implements Disposable {
 
   #buildItems(size: ConsoleSize | undefined): TextItem[] {
     const items: TextItem[] = [];
+    const ctx = { size };
     for (const seg of this.#segments) {
       // headers used to be emitted as `(size) => formatTailHeader(...)`
       // closures so they could re-fit on console-size changes — but the
       // deferred item we register on the scope already runs per draw, so
-      // we compute the header string inline here and skip a closure per
+      // we resolve the header string inline here and skip a closure per
       // segment per tick.
-      if (seg.header != null) items.push(formatTailHeader(seg.header, size));
-      for (const line of seg.lines.takeLast(seg.maxLines)) items.push(indentTailLine(line));
+      if (seg.headerFn != null) {
+        const text = seg.headerFn(ctx);
+        items.push(seg.headerVerbatim ? truncateHeaderToWidth(text, size) : formatTailHeader(text, size));
+      }
+      for (const line of seg.lines.takeLast(seg.visibleLineCount(ctx))) items.push(indentTailLine(line));
     }
     return items;
   }
@@ -296,11 +301,162 @@ export const DEFAULT_INHERIT_TAIL_LINES = 5;
  */
 export const DEFAULT_INHERIT_TAIL_ERROR_LINES = 80;
 
+/** Context passed to a `TailMaxLines` callback at draw time. */
+export interface TailMaxLinesContext {
+  /** Current terminal size, or `undefined` if the host isn't a TTY. */
+  size: ConsoleSize | undefined;
+}
+
+/** Total number of rows the tail occupies — header included — so two
+ * commands tailing at `"50%"` each compose into a full screen instead of
+ * spilling. When a header is shown the visible output count is `maxLines - 1`,
+ * clamped to at least 1 row of output (so a headered tail is always at
+ * least 2 rows total). Accepts:
+ * - A literal `number`, taken as-is.
+ * - A string like `"50%"`, resolved against the terminal's row count at draw
+ *   time so the tail re-fits if the user resizes mid-run.
+ * - A function called per draw — for cases neither form covers, e.g.
+ *   `(ctx) => Math.min(10, (ctx.size?.rows ?? 24) - 5)` to leave headroom. */
+export type TailMaxLines = number | `${number}%` | ((ctx: TailMaxLinesContext) => number);
+
+/** Context passed to a `TailHeader` callback at draw time. */
+export interface TailHeaderContext {
+  /** The raw command text being run. */
+  command: string;
+  /** Current terminal size, or `undefined` if the host isn't a TTY. */
+  size: ConsoleSize | undefined;
+}
+
+/** Header rendered above the live tail.
+ * - `undefined` (default): `Running <command>` while running, `Ran <command>` in scrollback (when `printCommand()` is set).
+ * - `false`: no header.
+ * - `string`: rendered verbatim — you supply any styling.
+ * - function: called per draw with `{ command, size }`; the result is rendered verbatim.
+ *
+ * Regardless of this setting, the error path still emits `> <command>` to
+ * scrollback so failed commands stay unambiguous in logs. */
+export type TailHeader = string | false | ((ctx: TailHeaderContext) => string);
+
+/**
+ * Construction-time options for `InheritTailWriter`. The user-facing
+ * `.tailDisplay()` API maps onto this plus a few post-construction setters
+ * for header/promote behavior.
+ */
+export interface InheritTailWriterOptions {
+  /** Number of visible tail lines. See {@link TailMaxLines}.
+   * @default 5
+   */
+  maxLines?: TailMaxLines;
+  /** Treat the inner writer as TTY-attached. Defaults to `process.stderr.isTTY`.
+   * When false, writes pass through to the inner writer untouched (no pinned
+   * region) — used when the host process isn't a terminal. */
+  isTty?: boolean;
+  /** Renderer hosting the pinned scrolling region. Defaults to the global
+   * one tied to `staticText` + `renderInterval`. Tests pass a custom
+   * renderer to capture the emitted ANSI bytes in isolation. */
+  renderer?: TailRenderer;
+  /** Header text or per-draw callback (already pre-bound — accepts only
+   * `{ size }`). Set in the constructor so the segment is fully labeled
+   * before it gets registered with the renderer; otherwise the live area
+   * could paint a header-less segment for one tick. */
+  header?: string | ((ctx: { size: ConsoleSize | undefined }) => string);
+  /** When true, render `header` as-is (no `Running` / `Ran` framing). */
+  headerVerbatim?: boolean;
+  /** Always-shown command label on the error scrollback path, even when
+   * `header` is hidden or customized. */
+  errorContext?: string;
+  /** When true, promote the header to scrollback as `Ran <cmd>` (or the
+   * verbatim header) on success — typically wired to `.printCommand()`. */
+  promoteHeaderOnSuccess?: boolean;
+}
+
+/**
+ * Configuration for `.tailDisplay()`. Pass `true` to enable with defaults,
+ * or an options object to customize.
+ */
+export interface TailDisplayOptions {
+  /** Number of visible tail lines. See {@link TailMaxLines}.
+   * @default 5
+   */
+  maxLines?: TailMaxLines;
+  /** Header rendered above the live tail. See {@link TailHeader}. */
+  header?: TailHeader;
+}
+
+/** Internal: a maxLines value normalized into a uniform per-draw callback,
+ * so the renderer doesn't dispatch on type each tick. */
+type ResolvedMaxLinesFn = (ctx: TailMaxLinesContext) => number;
+
+/** Internal: a header value normalized into a uniform per-draw callback.
+ * The user-facing `(ctx: TailHeaderContext) => string` is pre-bound with
+ * the command text by command.ts before reaching state, so the renderer
+ * (which only knows about `size`) can call it uniformly. */
+type ResolvedHeaderFn = (ctx: { size: ConsoleSize | undefined }) => string;
+
+/** Normalize a user-provided `TailMaxLines` (number / percentage / callback)
+ * into a single function the renderer can call without dispatching on type. */
+function makeMaxLinesResolver(value: TailMaxLines): ResolvedMaxLinesFn {
+  if (typeof value === "function") return value;
+  if (typeof value === "number") {
+    // reject NaN/Infinity early — they propagate into the ring-buffer
+    // capacity (`new Array(NaN)` throws RangeError) and into takeLast,
+    // which would silently render an empty live tail.
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`Invalid tailDisplay maxLines: ${value}`);
+    }
+    const n = Math.max(1, Math.floor(value));
+    return () => n;
+  }
+  // "N%" — relative to terminal rows. Captured into a closure so percentages
+  // and explicit functions follow the same code path inside the renderer.
+  const match = /^(\d+(?:\.\d+)?)%$/.exec(value);
+  if (!match) throw new TypeError(`Invalid tailDisplay maxLines: ${JSON.stringify(value)}`);
+  const fraction = parseFloat(match[1]) / 100;
+  return ({ size }) => {
+    // No rows to compute against (piped to a file, etc.) — fall back to the
+    // baseline so percentage callers don't have to handle `undefined`.
+    if (size?.rows == null) return DEFAULT_INHERIT_TAIL_LINES;
+    return Math.max(1, Math.floor(size.rows * fraction));
+  };
+}
+
+/** Collapse whitespace and trim, returning `undefined` for empty input.
+ * Shared by header and errorContext so both have the same single-line shape. */
+function normalizeHeaderText(text: string | undefined): string | undefined {
+  if (text == null) return undefined;
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Truncate a verbatim header to fit the terminal width with an ellipsis.
+ * Visible width is measured against the ANSI-stripped string so headers
+ * styled with color escapes (`colors.red(...)`) don't get cut mid-escape on
+ * narrow terminals. The styled original is returned when it fits; on
+ * overflow the styling is dropped along with the truncated tail (the only
+ * way to keep the result fitting without parsing every CSI sequence). */
+function truncateHeaderToWidth(text: string, size: ConsoleSize | undefined): string {
+  const cols = size?.columns ?? 80;
+  const visible = stripAnsiCodes(text);
+  if (visible.length <= cols) return text;
+  return visible.slice(0, Math.max(1, cols - 1)) + "…";
+}
+
 class InheritTailState {
-  readonly maxLines: number;
+  readonly resolveMaxLines: ResolvedMaxLinesFn;
   readonly lines: LineRingBuffer;
   readonly enabled: boolean;
-  header: string | undefined;
+  /** Per-draw callback that produces the header text. `undefined` means
+   * "no header" (live tail renders no label). Percentages, raw strings and
+   * user callbacks are all normalized into this single shape upstream. */
+  headerFn: ResolvedHeaderFn | undefined;
+  /** When true, the header is rendered verbatim instead of being framed
+   * with the built-in `Running <text>` / `Ran <text>` styling. Set when
+   * the user supplies a custom header string or function. */
+  headerVerbatim = false;
+  /** Always-present fallback shown on the error path, even if the live
+   * header is hidden or customized — so error scrollback is unambiguous
+   * about which command failed. */
+  errorContext: string | undefined;
   promoteHeaderOnSuccess = false;
   #refCount = 0;
   #disposed = false;
@@ -313,20 +469,30 @@ class InheritTailState {
 
   constructor(
     renderer: TailRenderer,
-    maxLines: number,
+    maxLines: TailMaxLines,
     isTty: boolean,
     maxErrorLines: number = DEFAULT_INHERIT_TAIL_ERROR_LINES,
   ) {
     this.renderer = renderer;
-    this.maxLines = Math.max(1, maxLines);
-    // one ring sized to the larger error budget; the live tail is just the
-    // last `maxLines` slice of it, so no separate small buffer needed.
-    this.lines = new LineRingBuffer(Math.max(this.maxLines, maxErrorLines));
+    this.resolveMaxLines = makeMaxLinesResolver(maxLines);
+    // size the ring against the construction-time resolution so the buffer
+    // can fit the worst-case live tail. if the terminal grows mid-run the
+    // ring caps the visible window at this size — typical use stays bounded.
+    const initial = this.resolveMaxLines({ size: renderer.container.getConsoleSize() });
+    this.lines = new LineRingBuffer(Math.max(initial, maxErrorLines));
     this.enabled = isTty;
   }
 
   get omittedLineCount(): number {
     return Math.max(0, this.#totalLinesSeen - this.lines.size);
+  }
+
+  /** Visible output rows after subtracting the header (if any) from the
+   * total `maxLines` budget. Floors to 1 so a headered segment always shows
+   * at least one line. */
+  visibleLineCount(ctx: TailMaxLinesContext): number {
+    const total = this.resolveMaxLines(ctx);
+    return Math.max(1, this.headerFn != null ? total - 1 : total);
   }
 
   addRef(): void {
@@ -337,11 +503,21 @@ class InheritTailState {
     }
   }
 
-  setHeader(text: string | undefined): void {
-    const trimmed = text == null ? undefined : text.replace(/\s+/g, " ").trim();
-    this.header = trimmed && trimmed.length > 0 ? trimmed : undefined;
-    // no explicit redraw — the renderer's deferred items pick up the new
-    // header on the next tick.
+  setHeader(
+    header: string | ResolvedHeaderFn | undefined,
+    options?: { verbatim?: boolean },
+  ): void {
+    if (header == null) {
+      this.headerFn = undefined;
+    } else if (typeof header === "string") {
+      const trimmed = normalizeHeaderText(header);
+      this.headerFn = trimmed != null ? () => trimmed : undefined;
+    } else {
+      this.headerFn = header;
+    }
+    this.headerVerbatim = options?.verbatim ?? false;
+    // no explicit redraw — the renderer's deferred items pick up the change
+    // on the next tick.
   }
 
   appendLines(newLines: string[]): void {
@@ -370,12 +546,17 @@ class InheritTailState {
   #flushAbove(): void {
     const preserved: TextItem[] = [];
     if (this.#errored) {
-      // emit the command header unconditionally on error so the scrollback
-      // always records which command failed (even if `.printCommand()` was
-      // off), in the same `> <cmd>` format the default printCommand logger
-      // uses so both renderings look uniform.
-      if (this.header != null) {
-        preserved.push(`${colors.white(">")} ${colors.blue(this.header)}`);
+      // emit the raw command on error so scrollback always records which
+      // command failed — in the same `> <cmd>` format the default
+      // printCommand logger uses, so both renderings look uniform. prefer
+      // `errorContext` (the raw command) over the live header so a custom
+      // or hidden header doesn't leave error logs ambiguous; if neither is
+      // set, fall back to the live header text.
+      if (this.errorContext != null) {
+        preserved.push(`${colors.white(">")} ${colors.blue(this.errorContext)}`);
+      } else if (this.headerFn != null) {
+        const headerFn = this.headerFn;
+        preserved.push((size) => `${colors.white(">")} ${colors.blue(headerFn({ size }))}`);
       }
       const omitted = this.omittedLineCount;
       if (omitted > 0) {
@@ -384,13 +565,17 @@ class InheritTailState {
       }
       for (const line of this.lines) preserved.push(indentTailLine(line));
       for (const line of this.#trailingLines) preserved.push(indentTailLine(line));
-    } else if (this.promoteHeaderOnSuccess && this.header != null) {
-      // `Ran <cmd>` on success mirrors what `.printCommand()` would print
-      // upfront, so only promote it when the caller asked for the command
-      // to be visible in the host's scrollback. Without that opt-in, the
-      // live tail clears silently.
-      const header = this.header;
-      preserved.push((size) => formatRanHeader(header, size));
+    } else if (this.promoteHeaderOnSuccess && this.headerFn != null) {
+      // success scrollback mirrors the live header style: built-in
+      // `Ran <cmd>` for the default header, the user's verbatim text
+      // otherwise. only promoted when the caller opted in via
+      // `.printCommand()` — without that, live tail clears silently.
+      const headerFn = this.headerFn;
+      const verbatim = this.headerVerbatim;
+      preserved.push((size) => {
+        const text = headerFn({ size });
+        return verbatim ? truncateHeaderToWidth(text, size) : formatRanHeader(text, size);
+      });
     }
     if (preserved.length > 0) this.renderer.logAbove(preserved);
   }
@@ -420,27 +605,45 @@ export class InheritTailWriter implements WriterSync, Disposable {
   #pending = "";
   #finalized = false;
 
-  constructor(innerWriter: WriterSync, maxLines?: number, isTty?: boolean, renderer?: TailRenderer);
+  constructor(innerWriter: WriterSync, options?: InheritTailWriterOptions);
   constructor(innerWriter: WriterSync, sibling: InheritTailWriter);
   constructor(
     innerWriter: WriterSync,
-    maxLinesOrSibling: number | InheritTailWriter = DEFAULT_INHERIT_TAIL_LINES,
-    isTty: boolean = isStderrTty(),
-    renderer: TailRenderer = defaultTailRenderer,
+    optionsOrSibling: InheritTailWriterOptions | InheritTailWriter = {},
   ) {
     this.#innerWriter = innerWriter;
-    if (typeof maxLinesOrSibling === "number") {
-      this.#state = new InheritTailState(renderer, maxLinesOrSibling, isTty);
+    if (optionsOrSibling instanceof InheritTailWriter) {
+      this.#state = optionsOrSibling.#state;
     } else {
-      this.#state = maxLinesOrSibling.#state;
+      const opts = optionsOrSibling;
+      const renderer = opts.renderer ?? defaultTailRenderer;
+      const maxLines = opts.maxLines ?? DEFAULT_INHERIT_TAIL_LINES;
+      const isTty = opts.isTty ?? isStderrTty();
+      const state = new InheritTailState(renderer, maxLines, isTty);
+      // apply config BEFORE addRef so the segment is fully labeled by the
+      // time the renderer paints — otherwise the first tick after register
+      // shows a header-less segment.
+      if (opts.header !== undefined) {
+        state.setHeader(opts.header, { verbatim: opts.headerVerbatim });
+      }
+      if (opts.errorContext !== undefined) {
+        state.errorContext = normalizeHeaderText(opts.errorContext);
+      }
+      if (opts.promoteHeaderOnSuccess !== undefined) {
+        state.promoteHeaderOnSuccess = opts.promoteHeaderOnSuccess;
+      }
+      this.#state = state;
     }
     this.#state.addRef();
   }
 
-  /** Snapshot of the live tail (last `maxLines` retained lines, oldest
-   * first). */
+  /** Snapshot of the live tail (last visible-window retained lines, oldest
+   * first). The visible-window size is `maxLines - 1` when a header is shown
+   * (recomputed from the current console size for percentage / callback
+   * `maxLines`). */
   get tailLines(): readonly string[] {
-    return Array.from(this.#state.lines.takeLast(this.#state.maxLines));
+    const size = this.#state.renderer.container.getConsoleSize();
+    return Array.from(this.#state.lines.takeLast(this.#state.visibleLineCount({ size })));
   }
 
   /** Number of completed lines that were dropped from the retained ring
@@ -452,11 +655,30 @@ export class InheritTailWriter implements WriterSync, Disposable {
 
   /**
    * Sets a label rendered above the tail lines that identifies what this
-   * scrolling region is showing. Typically the command text. Empty/undefined
-   * removes the header. Long text is truncated to the terminal width.
+   * scrolling region is showing. Accepts a literal string (collapsed to
+   * a single line) or a per-draw callback that receives the current
+   * `{ size }`. `undefined` removes the header. Long text is truncated to
+   * the terminal width.
+   *
+   * When `options.verbatim` is true, the text is rendered as-is (no
+   * built-in `Running` / `Ran` framing). Used by `.tailDisplay({ header })`
+   * so the caller has full control over styling.
    */
-  setHeader(text: string | undefined): void {
-    this.#state.setHeader(text);
+  setHeader(
+    header: string | ((ctx: { size: ConsoleSize | undefined }) => string) | undefined,
+    options?: { verbatim?: boolean },
+  ): void {
+    this.#state.setHeader(header, options);
+  }
+
+  /**
+   * Sets the command label preserved on the error scrollback path even
+   * when the live header is hidden or customized — so `> <command>` is
+   * always shown when a tailed command fails, regardless of `.tailDisplay`
+   * header config.
+   */
+  setErrorContext(text: string | undefined): void {
+    this.#state.errorContext = normalizeHeaderText(text);
   }
 
   /**
@@ -496,11 +718,22 @@ export class InheritTailWriter implements WriterSync, Disposable {
    * the scope is disposed, so "which commands ran" remains visible after
    * the transient tail clears. When multiple writers share a scope the
    * scope is only disposed once all of them have finalized.
+   *
+   * Any partial pending line is still passed to `release` so that — if a
+   * sibling writer subsequently errors — the success side's last partial
+   * line is preserved in the error scrollback. The success path itself
+   * never renders trailing lines, so there's no visual cost when no
+   * sibling errors.
    */
   finalize(): void {
     if (this.#finalized) return;
     this.#finalized = true;
-    this.#state.release(false, []);
+    const trailing: string[] = [];
+    if (this.#pending.length > 0) {
+      trailing.push(stripTrailingCR(this.#pending));
+      this.#pending = "";
+    }
+    this.#state.release(false, trailing);
   }
 
   [Symbol.dispose](): void {

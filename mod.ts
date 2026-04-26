@@ -17,6 +17,11 @@ export {
   type Reader,
   type ShellPipeReaderKind,
   type ShellPipeWriterKind,
+  type TailDisplayOptions,
+  type TailHeader,
+  type TailHeaderContext,
+  type TailMaxLines,
+  type TailMaxLinesContext,
   type WriterSync,
 } from "./src/pipes.ts";
 export {
@@ -41,3 +46,5 @@ export default $;
 export { create, FsFile, open, type OpenOptions, type WriteFileOptions } from "./src/fsFile.ts";
 export type { Signal } from "./src/signal.ts";
 export { type Delay, delayToMs } from "./src/common.ts";
+export type { ConsoleSize } from "@david/console-static-text";
+export { Path } from "@david/path";
