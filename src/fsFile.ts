@@ -6,18 +6,29 @@ const openAsync = nodeUtil.promisify(fs.open);
 
 /** Options for writing a file, used by `RequestBuilder#pipeToPath`. */
 export interface WriteFileOptions {
+  /** Append to the file rather than truncating it. */
   append?: boolean;
+  /** Create the file if it does not already exist. */
   create?: boolean;
+  /** Fail if the file already exists. */
   createNew?: boolean;
+  /** File mode (Unix permission bits) applied when creating. */
   mode?: number;
+  /** Signal that aborts the write. */
   signal?: AbortSignal;
 }
 
+/** Options for opening a file via {@link open}. */
 export interface OpenOptions {
+  /** Open the file for reading. */
   read?: boolean;
+  /** Open the file for writing. */
   write?: boolean;
+  /** Create the file if it does not already exist. */
   create?: boolean;
+  /** Truncate the file to zero length when opening. */
   truncate?: boolean;
+  /** Append to the file rather than truncating it. */
   append?: boolean;
 }
 
@@ -25,10 +36,13 @@ export interface OpenOptions {
 export class FsFile {
   #fd: number;
 
+  /** Wraps an existing open file descriptor. */
   constructor(fd: number) {
     this.#fd = fd;
   }
 
+  /** Reads up to `p.length` bytes into `p`, returning the number of bytes
+   * read or `null` on EOF. */
   read(p: Uint8Array): Promise<number | null> {
     return new Promise((resolve, reject) => {
       fs.read(this.#fd, p, 0, p.length, null, (err, bytesRead) => {
@@ -38,19 +52,24 @@ export class FsFile {
     });
   }
 
+  /** Synchronous variant of {@link FsFile.read}. */
   readSync(p: Uint8Array): number | null {
     const bytesRead = fs.readSync(this.#fd, p);
     return bytesRead === 0 ? null : bytesRead;
   }
 
+  /** Writes the provided bytes to the file, returning the number of bytes
+   * written. */
   write(p: Uint8Array): Promise<number> {
     return writeAll(this.#fd, p);
   }
 
+  /** Synchronous variant of {@link FsFile.write}. */
   writeSync(p: Uint8Array): number {
     return writeSyncAll(this.#fd, p);
   }
 
+  /** Closes the underlying file descriptor. */
   close(): void {
     try {
       fs.closeSync(this.#fd);
@@ -59,6 +78,7 @@ export class FsFile {
     }
   }
 
+  /** A `WritableStream` that writes to this file. */
   get writable(): WritableStream<Uint8Array> {
     const write = this.write.bind(this);
     return new WritableStream({
@@ -68,16 +88,19 @@ export class FsFile {
     });
   }
 
+  /** Closes the file when used with `using` declarations. */
   [Symbol.dispose](): void {
     this.close();
   }
 }
 
+/** Opens the file at `filePath` with the given options. */
 export async function open(filePath: string, options: OpenOptions): Promise<FsFile> {
   const fd = await openAsync(filePath, openOptionsToFlags(options));
   return new FsFile(fd);
 }
 
+/** Creates (or truncates) the file at `filePath` and opens it for writing. */
 export async function create(filePath: string): Promise<FsFile> {
   const fd = await openAsync(filePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC);
   return new FsFile(fd);

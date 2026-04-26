@@ -1166,7 +1166,11 @@ async function resolveCommand(unresolvedCommand: UnresolvedCommand, context: Con
   };
 }
 
+/** `RealEnvironment` extension used by `which` lookups. Adds a Deno
+ * permission request hook so command resolution can read directories on
+ * `PATH` without prompting per-entry. */
 export class WhichEnv extends RealEnvironment {
+  /** Requests read permission for the provided directory under Deno. */
   requestPermission(folderPath: string): void {
     // only relevant under Deno — Node has no permissions API
     // dnt-shim-ignore
@@ -1177,6 +1181,7 @@ export class WhichEnv extends RealEnvironment {
     });
   }
 }
+/** Default `WhichEnv` instance reused across the library. */
 export const whichRealEnv: WhichEnv = new WhichEnv();
 
 export async function whichFromContext(commandName: string, context: {

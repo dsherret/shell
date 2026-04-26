@@ -118,6 +118,8 @@ export type PipeWriter = Writer | WriterSync;
 /** An awaitable that resolves to an object exposing a `readable` stream —
  * e.g. a `RequestBuilder` that resolves to a response with `.readable`. */
 export interface AwaitableReadable {
+  /** Resolves to an object that exposes a `ReadableStream<Uint8Array>` via
+   * its `readable` property. */
   then<TResult1 = { readable: ReadableStream<Uint8Array> }, TResult2 = never>(
     onfulfilled?:
       | ((value: { readable: ReadableStream<Uint8Array> }) => TResult1 | PromiseLike<TResult1>)
