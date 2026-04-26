@@ -41,12 +41,14 @@ import {
   CapturingBufferWriterSync,
   InheritStaticTextBypassWriter,
   InheritTailWriter,
+  type InheritTailWriterOptions,
   NullPipeWriter,
   PipedBuffer,
   type Reader,
   type ShellPipeReaderKind,
   ShellPipeWriter,
   type ShellPipeWriterKind,
+  type TailDisplayOptions,
   type Writer,
   type WriterSync,
 } from "./pipes.ts";
@@ -87,7 +89,7 @@ interface CommandBuilderState {
   combinedStdoutStderr: boolean;
   stdout: ShellPipeWriterKindWithOptions;
   stderr: ShellPipeWriterKindWithOptions;
-  tailDisplay: boolean;
+  tailDisplay: false | TailDisplayOptions;
   noThrow: boolean | number[];
   env: Record<string, string | undefined>;
   commands: Record<string, CommandHandler>;
@@ -195,7 +197,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         kind: state.stderr.kind,
         options: state.stderr.options,
       },
-      tailDisplay: state.tailDisplay,
+      tailDisplay: state.tailDisplay === false ? false : { ...state.tailDisplay },
       noThrow: state.noThrow instanceof Array ? [...state.noThrow] : state.noThrow,
       env: { ...state.env },
       cwd: state.cwd,
@@ -440,14 +442,29 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * what happened. Has no effect on non-TTY output or on streams
    * routed elsewhere (piped, null, WritableStream, Path, etc.).
    *
+   * Pass an options object to customize the visible line count or header.
+   *
    * @example
    * ```ts
    * await $`./build.sh`.tailDisplay();
+   * await $`./build.sh`.tailDisplay({ maxLines: 2, header: false });
+   * await $`./build.sh`.tailDisplay({
+   *   maxLines: "50%",
+   *   header: ({ command }) => `building ${command}...`,
+   * });
    * ```
    */
-  tailDisplay(value = true): CommandBuilder {
+  tailDisplay(value?: boolean): CommandBuilder;
+  tailDisplay(options: TailDisplayOptions): CommandBuilder;
+  tailDisplay(valueOrOptions: boolean | TailDisplayOptions = true): CommandBuilder {
     return this.#newWithState((state) => {
-      state.tailDisplay = value;
+      if (valueOrOptions === false) {
+        state.tailDisplay = false;
+      } else if (valueOrOptions === true) {
+        state.tailDisplay = {};
+      } else {
+        state.tailDisplay = { ...valueOrOptions };
+      }
     });
   }
 
@@ -920,11 +937,13 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   }
 
   if (state.printCommand) {
-    // when tailDisplay is on, the scrolling region's header already shows
-    // the command text while running and gets promoted to scrollback on
-    // finalize — skip the upfront log so we don't print the command twice
-    // (once at start, once at end).
-    if (!state.tailDisplay) {
+    // when tailDisplay is on AND its header is showing, the scrolling
+    // region's header already announces the command and gets promoted to
+    // scrollback on finalize — skip the upfront log so we don't print
+    // twice. when the user opted into `header: false` there's no live
+    // label, so the upfront log still runs.
+    const tailHidesCommand = state.tailDisplay !== false && state.tailDisplay.header !== false;
+    if (!tailHidesCommand) {
       state.printCommandLogger.getValue()(state.command.text);
     }
   }
@@ -962,29 +981,23 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
       },
     });
   }
+  // resolve tail config up front so the InheritTailWriter is constructed in
+  // its final state — applying header/errorContext/promote AFTER the writer
+  // has registered with the renderer can leave a one-tick window where the
+  // pinned region paints without a header.
+  const resolvedTailWriterOptions = state.tailDisplay !== false
+    ? resolveTailWriterOptions(state.tailDisplay, state.command.text, Boolean(state.printCommand))
+    : undefined;
   const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
-  // label active tail scrolling regions with the command text so it's
-  // obvious which command the tail belongs to, especially when running
-  // commands in parallel. success-path promotion of the `Ran <cmd>` line
-  // is gated on `.printCommand()` — without that opt-in the live tail
-  // clears silently on success. the error path always promotes the header
-  // plus retained context regardless.
-  for (const tw of tailWriters) {
-    tw.setHeader(state.command.text);
-    tw.setPromoteHeaderOnSuccess(Boolean(state.printCommand));
-  }
   // when tailDisplay is on for an `"inherit"` stream we need Node's spawn
   // to pipe the child's output through us instead of connecting the child
   // directly to the parent's fd (which would bypass the InheritTailWriter
   // entirely). report the kind as `"inheritPiped"` at the shell level so
   // the executable handler reads from the pipe and forwards bytes through
   // our writer chain. user-facing `state.stdout.kind` stays `"inherit"`.
-  const stdoutShellKind = state.tailDisplay && state.stdout.kind === "inherit"
-    ? "inheritPiped" as const
-    : state.stdout.kind;
-  const stderrShellKind = state.tailDisplay && state.stderr.kind === "inherit"
-    ? "inheritPiped" as const
-    : state.stderr.kind;
+  const tailEnabled = state.tailDisplay !== false;
+  const stdoutShellKind = tailEnabled && state.stdout.kind === "inherit" ? "inheritPiped" as const : state.stdout.kind;
+  const stderrShellKind = tailEnabled && state.stderr.kind === "inherit" ? "inheritPiped" as const : state.stderr.kind;
   const stdout = new ShellPipeWriter(
     stdoutShellKind,
     stdoutBuffer === "null" ? new NullPipeWriter() : stdoutBuffer === "inherit" ? stdoutStream : stdoutBuffer,
@@ -1128,11 +1141,14 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     // InheritTailWriter. when both stdout and stderr are tailed, share the
     // scrolling region between them so the two streams interleave into one
     // tail with a single header — mirrors how a user reads terminal output.
-    const stdoutTail = state.tailDisplay && canTail(state.stdout.kind)
-      ? new InheritTailWriter(stdoutStream)
+    const tailOpts = resolvedTailWriterOptions;
+    const stdoutTail = tailOpts && canTail(state.stdout.kind)
+      ? new InheritTailWriter(stdoutStream, tailOpts)
       : undefined;
-    const stderrTail = state.tailDisplay && canTail(state.stderr.kind)
-      ? (stdoutTail != null ? new InheritTailWriter(stderrStream, stdoutTail) : new InheritTailWriter(stderrStream))
+    const stderrTail = tailOpts && canTail(state.stderr.kind)
+      ? (stdoutTail != null
+        ? new InheritTailWriter(stderrStream, stdoutTail)
+        : new InheritTailWriter(stderrStream, tailOpts))
       : undefined;
     const tailWriters: InheritTailWriter[] = [];
     if (stdoutTail != null) tailWriters.push(stdoutTail);
@@ -1394,6 +1410,39 @@ export class CommandResult {
     }
     return this.#combined.bytes({ copy: false });
   }
+}
+
+/** Translate the user-facing `TailDisplayOptions` plus the surrounding
+ * command context into the constructor-ready shape `InheritTailWriter`
+ * expects. The user's `header` callback (if any) is pre-bound with the
+ * command text here so the renderer (which only knows `size`) can call
+ * it uniformly per draw. */
+function resolveTailWriterOptions(
+  display: TailDisplayOptions,
+  command: string,
+  promoteHeaderOnSuccess: boolean,
+): InheritTailWriterOptions {
+  const headerOpt = display.header;
+  let header: InheritTailWriterOptions["header"];
+  let headerVerbatim = false;
+  if (headerOpt === false) {
+    header = undefined;
+  } else if (typeof headerOpt === "function") {
+    header = ({ size }) => headerOpt({ command, size });
+    headerVerbatim = true;
+  } else if (typeof headerOpt === "string") {
+    header = headerOpt;
+    headerVerbatim = true;
+  } else {
+    header = command;
+  }
+  return {
+    maxLines: display.maxLines,
+    header,
+    headerVerbatim,
+    errorContext: command,
+    promoteHeaderOnSuccess,
+  };
 }
 
 function buildEnv(env: Record<string, string | undefined>, clearEnv: boolean) {
