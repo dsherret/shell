@@ -1,4 +1,6 @@
 export {
+  type BeforeCommandCallback,
+  type BeforeCommandSyncCallback,
   CommandBuilder,
   CommandChild,
   CommandResult,
