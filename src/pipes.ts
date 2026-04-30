@@ -257,12 +257,12 @@ export class CapturingBufferWriterSync implements WriterSync {
 }
 
 /** Async tap that mirrors writes into a {@link ByteRingBuffer} for use as
- * "errorContext" — the ring keeps the trailing N bytes of whatever the
+ * "errorTail" — the ring keeps the trailing N bytes of whatever the
  * command sent through this stream, so they can be surfaced in the thrown
  * `Error` even when the underlying sink (a piped command, a `WritableStream`,
  * a file on disk) doesn't expose what was written. Pairs with
- * {@link ErrorContextCaptureWriterSync}. */
-export class ErrorContextCaptureWriter implements Writer {
+ * {@link ErrorTailCaptureWriterSync}. */
+export class ErrorTailCaptureWriter implements Writer {
   readonly ring: ByteRingBuffer;
   #innerWriter: Writer;
 
@@ -278,8 +278,8 @@ export class ErrorContextCaptureWriter implements Writer {
   }
 }
 
-/** Sync variant of {@link ErrorContextCaptureWriter}. */
-export class ErrorContextCaptureWriterSync implements WriterSync {
+/** Sync variant of {@link ErrorTailCaptureWriter}. */
+export class ErrorTailCaptureWriterSync implements WriterSync {
   readonly ring: ByteRingBuffer;
   #innerWriter: WriterSync;
 
@@ -417,10 +417,10 @@ export interface InheritTailWriterOptions {
  * to capture the last few screens worth of output — large enough to convey
  * what went wrong without ballooning memory for long-running commands.
  */
-export const DEFAULT_ERROR_CONTEXT_BYTES = 8 * 1024;
+export const DEFAULT_ERROR_TAIL_BYTES = 8 * 1024;
 
 /**
- * Configuration for `.errorContext()`. When enabled, dax silently retains
+ * Configuration for `.errorTail()`. When enabled, dax silently retains
  * the trailing N bytes of stdout and/or stderr and appends them to the
  * thrown `Error.message` if the command exits with a non-zero code.
  * Targets streams the user can't see — piped to another command,
@@ -429,7 +429,7 @@ export const DEFAULT_ERROR_CONTEXT_BYTES = 8 * 1024;
  * `"inheritPiped"`) are skipped since the bytes already reached the
  * user's scrollback.
  */
-export interface ErrorContextOptions {
+export interface ErrorTailOptions {
   /** Per-stream cap on retained bytes. Once exceeded, the oldest bytes
    * are dropped first.
    * @default 8192 (8 KiB) */

@@ -18,7 +18,7 @@ export type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWrit
 export {
   type AwaitableReadable,
   type Closer,
-  type ErrorContextOptions,
+  type ErrorTailOptions,
   type Reader,
   type ShellPipeReaderKind,
   type ShellPipeWriterKind,

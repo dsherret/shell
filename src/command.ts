@@ -40,10 +40,10 @@ import {
   type AwaitableReadable,
   CapturingBufferWriter,
   CapturingBufferWriterSync,
-  DEFAULT_ERROR_CONTEXT_BYTES,
-  ErrorContextCaptureWriter,
-  ErrorContextCaptureWriterSync,
-  type ErrorContextOptions,
+  DEFAULT_ERROR_TAIL_BYTES,
+  ErrorTailCaptureWriter,
+  ErrorTailCaptureWriterSync,
+  type ErrorTailOptions,
   InheritStaticTextBypassWriter,
   InheritTailWriter,
   type InheritTailWriterOptions,
@@ -98,7 +98,7 @@ interface CommandBuilderState {
   stdout: ShellPipeWriterKindWithOptions;
   stderr: ShellPipeWriterKindWithOptions;
   tailDisplay: false | TailDisplayOptions;
-  errorContext: false | ErrorContextOptions;
+  errorTail: false | ErrorTailOptions;
   noThrow: boolean | number[];
   env: Record<string, string | undefined>;
   commands: Record<string, CommandHandler>;
@@ -213,7 +213,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       kind: "inherit",
     },
     tailDisplay: false,
-    errorContext: false,
+    errorTail: false,
     noThrow: false,
     env: {},
     cwd: undefined,
@@ -249,7 +249,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         options: state.stderr.options,
       },
       tailDisplay: state.tailDisplay === false ? false : { ...state.tailDisplay },
-      errorContext: state.errorContext === false ? false : { ...state.errorContext },
+      errorTail: state.errorTail === false ? false : { ...state.errorTail },
       noThrow: state.noThrow instanceof Array ? [...state.noThrow] : state.noThrow,
       env: { ...state.env },
       cwd: state.cwd,
@@ -655,24 +655,24 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * @example
    * ```ts
    * // when stdout is being captured for the return value (.text(),
-   * // .json(), .bytes(), etc.), errorContext surfaces it in the thrown
+   * // .json(), .bytes(), etc.), errorTail surfaces it in the thrown
    * // error if the command fails — without it the captured bytes vanish
    * // along with the result you never got.
-   * const output = await $`./build.sh`.errorContext().text();
-   * const output = await $`./build.sh`.errorContext({ maxBytes: 16 * 1024 }).text();
+   * const output = await $`./build.sh`.errorTail().text();
+   * const output = await $`./build.sh`.errorTail({ maxBytes: 16 * 1024 }).text();
    * ```
    */
-  errorContext(value?: boolean): CommandBuilder;
-  /** Enables errorContext capture with the provided options. */
-  errorContext(options: ErrorContextOptions): CommandBuilder;
-  errorContext(valueOrOptions: boolean | ErrorContextOptions = true): CommandBuilder {
+  errorTail(value?: boolean): CommandBuilder;
+  /** Enables errorTail capture with the provided options. */
+  errorTail(options: ErrorTailOptions): CommandBuilder;
+  errorTail(valueOrOptions: boolean | ErrorTailOptions = true): CommandBuilder {
     return this.#newWithState((state) => {
       if (valueOrOptions === false) {
-        state.errorContext = false;
+        state.errorTail = false;
       } else if (valueOrOptions === true) {
-        state.errorContext = {};
+        state.errorTail = {};
       } else {
-        state.errorContext = { ...valueOrOptions };
+        state.errorTail = { ...valueOrOptions };
       }
     });
   }
@@ -1214,15 +1214,15 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   // skipped for terminal-bound streams ("inherit" / "inheritPiped") since
   // the user already watched those bytes scroll by — surfacing them again
   // in the error would just be noise.
-  const errorContext = state.errorContext;
-  const errorContextMaxBytes = errorContext === false ? 0 : errorContext.maxBytes ?? DEFAULT_ERROR_CONTEXT_BYTES;
-  const stdoutErrorRing = shouldCaptureForErrorContext(errorContext, "stdout", state.stdout.kind)
-    ? new ByteRingBuffer(errorContextMaxBytes)
+  const errorTail = state.errorTail;
+  const errorTailMaxBytes = errorTail === false ? 0 : errorTail.maxBytes ?? DEFAULT_ERROR_TAIL_BYTES;
+  const stdoutErrorRing = shouldCaptureForErrorTail(errorTail, "stdout", state.stdout.kind)
+    ? new ByteRingBuffer(errorTailMaxBytes)
     : undefined;
-  const stderrErrorRing = shouldCaptureForErrorContext(errorContext, "stderr", state.stderr.kind)
-    ? new ByteRingBuffer(errorContextMaxBytes)
+  const stderrErrorRing = shouldCaptureForErrorTail(errorTail, "stderr", state.stderr.kind)
+    ? new ByteRingBuffer(errorTailMaxBytes)
     : undefined;
-  // when tailDisplay or errorContext needs to tap a stream that would
+  // when tailDisplay or errorTail needs to tap a stream that would
   // otherwise bypass our writer chain (an "inherit" stream connects the
   // child directly to the parent's fd; a "null" stream wires the child to
   // /dev/null at the OS level), force the shell-level kind to a piped
@@ -1246,11 +1246,11 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     : stderrBuffer;
   const stdout = new ShellPipeWriter(
     stdoutShellKind,
-    stdoutErrorRing != null ? wrapWithErrorContextCapture(stdoutInner, stdoutErrorRing) : stdoutInner,
+    stdoutErrorRing != null ? wrapWithErrorTailCapture(stdoutInner, stdoutErrorRing) : stdoutInner,
   );
   const stderr = new ShellPipeWriter(
     stderrShellKind,
-    stderrErrorRing != null ? wrapWithErrorContextCapture(stderrInner, stderrErrorRing) : stderrInner,
+    stderrErrorRing != null ? wrapWithErrorTailCapture(stderrInner, stderrErrorRing) : stderrInner,
   );
   const { text: commandText, fds } = state.command;
   const signal = killSignalController.signal;
@@ -1292,7 +1292,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
           } else {
             message = `Exited with code: ${code}`;
           }
-          throw new Error(message + formatErrorContextSuffix(stdoutErrorRing, stderrErrorRing));
+          throw new Error(message + formatErrorTailSuffix(stdoutErrorRing, stderrErrorRing));
         }
       }
       for (const tw of tailWriters) tw.finalize();
@@ -1660,37 +1660,37 @@ export class CommandResult {
   }
 }
 
-/** Decide whether errorContext should capture the trailing bytes of a
+/** Decide whether errorTail should capture the trailing bytes of a
  * given stream. Skipped when the user disabled it for this stream and
  * when the stream is going to the user's terminal — for "inherit" /
  * "inheritPiped" they already saw the bytes, so duplicating them in the
  * error message would just be noise. */
-function shouldCaptureForErrorContext(
-  errorContext: false | ErrorContextOptions,
+function shouldCaptureForErrorTail(
+  errorTail: false | ErrorTailOptions,
   stream: "stdout" | "stderr",
   kind: ShellPipeWriterKind,
 ): boolean {
-  if (errorContext === false) return false;
-  if (errorContext[stream] === false) return false;
+  if (errorTail === false) return false;
+  if (errorTail[stream] === false) return false;
   if (kind === "inherit" || kind === "inheritPiped") return false;
   return true;
 }
 
 /** Resolve the shell-level pipe kind given the user-facing kind and whether
- * any tap (tailDisplay / errorContext) needs the bytes to flow through our
+ * any tap (tailDisplay / errorTail) needs the bytes to flow through our
  * writer chain. "inherit" and "null" both bypass our chain at the OS level,
  * so they need to be promoted to a piped variant when something will tap
  * them. tailDisplay can only tap "inherit" (canTail rejects "null"), so
- * "null" is only promoted when errorContext is capturing this stream —
+ * "null" is only promoted when errorTail is capturing this stream —
  * otherwise the OS-level discard stays the fast path. */
 function resolveShellKind(
   userKind: ShellPipeWriterKind,
   tailEnabled: boolean,
-  errorContextEnabled: boolean,
+  errorTailEnabled: boolean,
 ): ShellPipeWriterKind {
-  if (!tailEnabled && !errorContextEnabled) return userKind;
+  if (!tailEnabled && !errorTailEnabled) return userKind;
   if (userKind === "inherit") return "inheritPiped";
-  if (userKind === "null" && errorContextEnabled) return "piped";
+  if (userKind === "null" && errorTailEnabled) return "piped";
   return userKind;
 }
 
@@ -1698,21 +1698,21 @@ function resolveShellKind(
  * whether the inner exposes async `write` or sync `writeSync` — mirrors
  * the same dispatch `ShellPipeWriter.write` uses, so the wrapper appears
  * to be the same kind of writer as its inner. */
-function wrapWithErrorContextCapture(
+function wrapWithErrorTailCapture(
   inner: Writer | WriterSync,
   ring: ByteRingBuffer,
 ): Writer | WriterSync {
   if ("write" in inner) {
-    return new ErrorContextCaptureWriter(inner, ring);
+    return new ErrorTailCaptureWriter(inner, ring);
   }
-  return new ErrorContextCaptureWriterSync(inner, ring);
+  return new ErrorTailCaptureWriterSync(inner, ring);
 }
 
 /** Decode a captured ring buffer back to text and produce the suffix
  * appended to the thrown `Error.message`. Returns `""` when both rings
  * are empty (or absent), so the error message stays unchanged in cases
  * where the failed command never wrote anything. */
-function formatErrorContextSuffix(
+function formatErrorTailSuffix(
   stdoutRing: ByteRingBuffer | undefined,
   stderrRing: ByteRingBuffer | undefined,
 ): string {
