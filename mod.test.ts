@@ -3120,3 +3120,35 @@ Deno.test("errorTail: with stdout piped, surfaces the bytes in the error exactly
   assertStringIncludes(err.message, "Exited with code: 1");
   assertEquals(err.message.match(/stdout-bytes/g)?.length, 1);
 });
+
+Deno.test("errorTail: combined interleaves stdout and stderr into a single buffer", async () => {
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("out1"); console.error("err1"); console.log("out2"); Deno.exit(1);'`
+        .stdout("null")
+        .stderr("null")
+        .errorTail({ combined: true });
+    },
+    Error,
+  );
+  // combined mode: no stream labels, just interleaved output
+  assert(!err.message.includes("stdout:"));
+  assert(!err.message.includes("stderr:"));
+  assertStringIncludes(err.message, "out1");
+  assertStringIncludes(err.message, "err1");
+  assertStringIncludes(err.message, "out2");
+});
+
+Deno.test("errorTail: combined with only one stream enabled captures just that stream", async () => {
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("out-only"); console.error("err-only"); Deno.exit(1);'`
+        .stdout("null")
+        .stderr("null")
+        .errorTail({ combined: true, stdout: false });
+    },
+    Error,
+  );
+  assertStringIncludes(err.message, "err-only");
+  assert(!err.message.includes("out-only"));
+});

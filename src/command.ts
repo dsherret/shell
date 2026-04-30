@@ -1216,12 +1216,20 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   // in the error would just be noise.
   const errorTail = state.errorTail;
   const errorTailMaxBytes = errorTail === false ? 0 : errorTail.maxBytes ?? DEFAULT_ERROR_TAIL_BYTES;
-  const stdoutErrorRing = shouldCaptureForErrorTail(errorTail, "stdout", state.stdout.kind)
-    ? new ByteRingBuffer(errorTailMaxBytes)
-    : undefined;
-  const stderrErrorRing = shouldCaptureForErrorTail(errorTail, "stderr", state.stderr.kind)
-    ? new ByteRingBuffer(errorTailMaxBytes)
-    : undefined;
+  const errorTailCombined = errorTail !== false && errorTail.combined === true;
+  const captureStdout = shouldCaptureForErrorTail(errorTail, "stdout", state.stdout.kind);
+  const captureStderr = shouldCaptureForErrorTail(errorTail, "stderr", state.stderr.kind);
+  let stdoutErrorRing: ByteRingBuffer | undefined;
+  let stderrErrorRing: ByteRingBuffer | undefined;
+  let combinedErrorRing: ByteRingBuffer | undefined;
+  if (errorTailCombined && (captureStdout || captureStderr)) {
+    combinedErrorRing = new ByteRingBuffer(errorTailMaxBytes);
+    if (captureStdout) stdoutErrorRing = combinedErrorRing;
+    if (captureStderr) stderrErrorRing = combinedErrorRing;
+  } else {
+    if (captureStdout) stdoutErrorRing = new ByteRingBuffer(errorTailMaxBytes);
+    if (captureStderr) stderrErrorRing = new ByteRingBuffer(errorTailMaxBytes);
+  }
   // when tailDisplay or errorTail needs to tap a stream that would
   // otherwise bypass our writer chain (an "inherit" stream connects the
   // child directly to the parent's fd; a "null" stream wires the child to
@@ -1292,7 +1300,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
           } else {
             message = `Exited with code: ${code}`;
           }
-          throw new Error(message + formatErrorTailSuffix(stdoutErrorRing, stderrErrorRing));
+          throw new Error(message + formatErrorTailSuffix(stdoutErrorRing, stderrErrorRing, combinedErrorRing));
         }
       }
       for (const tw of tailWriters) tw.finalize();
@@ -1715,7 +1723,12 @@ function wrapWithErrorTailCapture(
 function formatErrorTailSuffix(
   stdoutRing: ByteRingBuffer | undefined,
   stderrRing: ByteRingBuffer | undefined,
+  combinedRing: ByteRingBuffer | undefined,
 ): string {
+  if (combinedRing != null) {
+    if (combinedRing.size === 0) return "";
+    return `\n\n${stripTrailingNewline(textDecoder.decode(combinedRing.toBytes()))}`;
+  }
   const stdoutText = stdoutRing != null && stdoutRing.size > 0 ? textDecoder.decode(stdoutRing.toBytes()) : "";
   const stderrText = stderrRing != null && stderrRing.size > 0 ? textDecoder.decode(stderrRing.toBytes()) : "";
   if (stdoutText.length === 0 && stderrText.length === 0) return "";

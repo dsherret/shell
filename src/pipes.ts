@@ -440,6 +440,11 @@ export interface ErrorTailOptions {
   /** Capture the trailing bytes of stderr.
    * @default true */
   stderr?: boolean;
+  /** Capture stdout and stderr into a single interleaved buffer instead
+   * of separate per-stream buffers. When true, the error message shows
+   * output in the order it was written rather than grouped by stream.
+   * @default false */
+  combined?: boolean;
 }
 
 /**
