@@ -114,9 +114,7 @@ interface CommandBuilderState {
  * nothing for a no-op.
  *
  * Unlike {@link BeforeCommandCallback}, this runs even on the `.spawn()` path
- * since no async work is involved. The thenable-unwrapping concern doesn't
- * apply here either, because the return value never passes through Promise
- * machinery — `return builder.env(...)` is just a function return.
+ * since no async work is involved.
  */
 export type BeforeCommandSyncCallback = (
   builder: CommandBuilder,
@@ -458,9 +456,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    */
   beforeCommandSync(callback: BeforeCommandSyncCallback): CommandBuilder {
     return this.#newWithState((state) => {
-      state.beforeCommandSync = state.beforeCommandSync == null
-        ? [callback]
-        : [...state.beforeCommandSync, callback];
+      state.beforeCommandSync = state.beforeCommandSync == null ? [callback] : [...state.beforeCommandSync, callback];
     });
   }
 
