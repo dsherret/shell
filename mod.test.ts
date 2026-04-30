@@ -2858,3 +2858,78 @@ Deno.test("globstar option", async () => {
     assertEquals(output3.combined, "sub\n");
   });
 });
+
+Deno.test("beforeCommand: async return survives thenable unwrapping", async () => {
+  // returning the builder from an async callback should NOT spawn it via
+  // thenable-unwrapping; both env vars should reach the spawned command
+  const result = await $`echo $AUTH_TOKEN-$EXTRA`
+    .beforeCommand(async (builder) => {
+      await new Promise((r) => setTimeout(r, 0));
+      return builder.env("AUTH_TOKEN", "Bearer-xyz");
+    })
+    .beforeCommand((builder) => builder.env("EXTRA", "second"))
+    .text();
+  assertEquals(result, "Bearer-xyz-second");
+});
+
+Deno.test("beforeCommand: chained method calls survive the proxy", async () => {
+  // `.env(...).env(...).env(...)` — every intermediate builder must remain
+  // non-thenable so the final return doesn't get unwrapped
+  const result = await $`echo $A-$B-$C`
+    .beforeCommand(async (builder) => {
+      await new Promise((r) => setTimeout(r, 0));
+      return builder.env("A", "1").env("B", "2").env("C", "3");
+    })
+    .text();
+  assertEquals(result, "1-2-3");
+});
+
+Deno.test("beforeCommand: no-op when nothing returned", async () => {
+  const result = await $`echo hello`
+    .stdout("piped")
+    .beforeCommand(() => {});
+  assertEquals(result.stdout, "hello\n");
+});
+
+Deno.test("beforeCommand: .spawn() throws when hooks are registered", () => {
+  const builder = $`echo hi`.beforeCommand(() => {});
+  assertThrows(
+    () => builder.spawn(),
+    Error,
+    "beforeCommand",
+  );
+});
+
+Deno.test("beforeCommandSync: works with .spawn()", async () => {
+  const child = $`echo $A-$B`
+    .stdout("piped")
+    .beforeCommandSync((builder) => builder.env("A", "1"))
+    .beforeCommandSync((builder) => builder.env("B", "2"))
+    .spawn();
+  const result = await child;
+  assertEquals(result.stdout, "1-2\n");
+});
+
+Deno.test("beforeCommandSync: works on the await path too", async () => {
+  const result = await $`echo $X`
+    .beforeCommandSync((builder) => builder.env("X", "sync-value"))
+    .text();
+  assertEquals(result, "sync-value");
+});
+
+Deno.test("beforeCommandSync: runs before async hooks on the await path", async () => {
+  // sync hook sets BASE; async hook reads/extends it via env composition
+  const result = await $`echo $TAG`
+    .beforeCommandSync((builder) => builder.env("TAG", "sync"))
+    .beforeCommand(async (builder) => {
+      await new Promise((r) => setTimeout(r, 0));
+      return builder.env("TAG", "sync-then-async");
+    })
+    .text();
+  assertEquals(result, "sync-then-async");
+});
+
+Deno.test("beforeCommandSync: a hook that returns nothing is a no-op", async () => {
+  const result = await $`echo hello`.beforeCommandSync(() => {}).text();
+  assertEquals(result, "hello");
+});

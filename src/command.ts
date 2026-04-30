@@ -105,7 +105,46 @@ interface CommandBuilderState {
   signal: KillSignal | undefined;
   encoding: string | undefined;
   shellOptions: Partial<ShellOptionsState>;
+  beforeCommand: BeforeCommandCallback[] | undefined;
+  beforeCommandSync: BeforeCommandSyncCallback[] | undefined;
 }
+
+/** Synchronous variant of {@link BeforeCommandCallback}. Receives the current
+ * builder and returns a (possibly modified) builder synchronously, or returns
+ * nothing for a no-op.
+ *
+ * Unlike {@link BeforeCommandCallback}, this runs even on the `.spawn()` path
+ * since no async work is involved.
+ */
+export type BeforeCommandSyncCallback = (
+  builder: CommandBuilder,
+) => CommandBuilder | void;
+
+/** Callback invoked before a command is spawned.
+ *
+ * Receives the current builder and may return a (possibly modified) builder
+ * to use for the spawn. Returning the builder unchanged — or returning
+ * nothing — is a no-op.
+ *
+ * The builder passed to the callback is wrapped in a Proxy that hides its
+ * `.then`, so it isn't detected as a thenable by the JavaScript Promise
+ * machinery. That makes it safe to `return builder.env(...)` from an `async`
+ * function without the runtime recursively unwrapping the thenable and
+ * triggering a spawn. Methods like `.env(...)` that return a new builder
+ * return another such wrapped Proxy.
+ *
+ * The return type is loose because TypeScript infers the async return type
+ * by following `PromiseLike` (the same logic the runtime uses), so e.g.
+ * `async b => b.env(...)` is inferred as `Promise<CommandResult>`.
+ */
+export type BeforeCommandCallback = (
+  builder: CommandBuilder,
+) =>
+  | CommandBuilder
+  | Promise<CommandBuilder>
+  | Promise<CommandResult>
+  | void
+  | Promise<void>;
 
 const textDecoder = new TextDecoder();
 const builtInCommands: Record<string, CommandHandler> = {
@@ -183,6 +222,8 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     signal: undefined,
     encoding: undefined,
     shellOptions: {},
+    beforeCommand: undefined,
+    beforeCommandSync: undefined,
   };
 
   #getClonedState(): CommandBuilderState {
@@ -213,6 +254,8 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       signal: state.signal,
       encoding: state.encoding,
       shellOptions: { ...state.shellOptions },
+      beforeCommand: state.beforeCommand,
+      beforeCommandSync: state.beforeCommandSync,
     };
   }
 
@@ -236,7 +279,8 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     // parseAndSpawnCommand, the awaiter's frame is no longer reachable from
     // the thrown error's async chain.
     const callerStack = captureCallerStack(this.then);
-    return parseAndSpawnCommand(this.#getClonedState(), callerStack).then(onfulfilled).catch(onrejected);
+    return this.#resolveStateForSpawn()
+      .then((state) => parseAndSpawnCommand(state, callerStack).then(onfulfilled).catch(onrejected));
   }
 
   /**
@@ -245,11 +289,65 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * This is an alias for awaiting the command builder or calling `.then(...)`
    */
   spawn(): CommandChild {
+    if (this.#state.beforeCommand != null && this.#state.beforeCommand.length > 0) {
+      // hooks may be async, but `.spawn()` is synchronous and must hand back a
+      // CommandChild whose pipedStdout/pipedStderr buffers and kill controller
+      // are already wired up. resolve async hooks via `await` instead, or use
+      // `.beforeCommandSync()` for sync-only hooks that work with `.spawn()`.
+      throw new Error(
+        ".spawn() cannot be used when .beforeCommand() hooks are registered; "
+          + "await the builder, call .then(), or use .beforeCommandSync() instead.",
+      );
+    }
     // store a snapshot of the current command
     // in case someone wants to spawn multiple
     // commands with different state
     const callerStack = captureCallerStack(this.spawn);
-    return parseAndSpawnCommand(this.#getClonedState(), callerStack);
+    return parseAndSpawnCommand(this.#runSyncHooks(), callerStack);
+  }
+
+  #runSyncHooks(): CommandBuilderState {
+    const callbacks = this.#state.beforeCommandSync;
+    if (callbacks == null || callbacks.length === 0) {
+      return this.#getClonedState();
+    }
+    let builder: CommandBuilder = this.#newWithState((state) => {
+      state.beforeCommandSync = undefined;
+    });
+    for (const cb of callbacks) {
+      const result = cb(builder);
+      if (result instanceof CommandBuilder) {
+        builder = result;
+      }
+    }
+    return builder.#getClonedState();
+  }
+
+  async #resolveStateForSpawn(): Promise<CommandBuilderState> {
+    // run sync hooks first (registration order within their kind), then async
+    let builder: CommandBuilder;
+    {
+      const syncState = this.#runSyncHooks();
+      builder = new CommandBuilder();
+      builder.#state = syncState;
+    }
+    const callbacks = this.#state.beforeCommand;
+    if (callbacks == null || callbacks.length === 0) {
+      return builder.#getClonedState();
+    }
+    // strip the hooks before running them so the builder passed to each callback
+    // can't accidentally recurse by appending to its own beforeCommand list
+    builder = builder.#newWithState((state) => {
+      state.beforeCommand = undefined;
+    });
+    for (const cb of callbacks) {
+      // wrap in a non-thenable Proxy so `return builder.env(...)` from an
+      // async callback isn't unwrapped (and re-spawned) by Promise machinery
+      const proxy = wrapCommandBuilderNonThenable(builder);
+      const result = (await (cb(proxy) as any)) as unknown;
+      builder = unwrapCommandBuilder(result) ?? builder;
+    }
+    return builder.#getClonedState();
   }
 
   /**
@@ -306,6 +404,59 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       } else {
         state.noThrow = [value, ...additional];
       }
+    });
+  }
+
+  /** Registers a callback that runs just before each command is spawned.
+   *
+   * The callback receives the current builder and may return a (possibly
+   * modified) builder to use for the spawn. Useful for asynchronously
+   * resolving values such as auth tokens or env vars.
+   *
+   * ```ts
+   * $`./build.sh`.beforeCommand(async (builder) => {
+   *   return builder.env("AUTH_TOKEN", await getAccessToken());
+   * });
+   * ```
+   *
+   * Multiple `.beforeCommand(...)` calls compose: each registered callback runs
+   * in the order it was added, with the builder produced by the previous one.
+   *
+   * The builder passed to the callback is in a special "passthrough" mode so
+   * its `.then(...)` resolves with the builder itself (instead of spawning) —
+   * this is what makes `return builder.env(...)` from an `async` function
+   * safe. If you construct a fresh `new CommandBuilder()` inside the callback,
+   * return it as `{ commandBuilder: ... }` to avoid an accidental spawn.
+   *
+   * Hooks are only resolved when the builder is awaited (or `.then()` is
+   * called). Calling `.spawn()` on a builder with registered hooks throws.
+   */
+  beforeCommand(callback: BeforeCommandCallback): CommandBuilder {
+    return this.#newWithState((state) => {
+      state.beforeCommand = state.beforeCommand == null ? [callback] : [...state.beforeCommand, callback];
+    });
+  }
+
+  /** Synchronous variant of {@link beforeCommand}. Unlike `.beforeCommand`,
+   * sync hooks also run on the `.spawn()` path, so they're suitable when you
+   * need streaming via `.spawn().stdout()` etc.
+   *
+   * The callback must return synchronously (`CommandBuilder` or nothing). The
+   * thenable-unwrapping concern doesn't apply here because the return value
+   * never passes through Promise machinery — `return builder.env(...)` is just
+   * a function return.
+   *
+   * ```ts
+   * const child = $`./build.sh`
+   *   .beforeCommandSync((builder) => builder.env("BUILD_ID", crypto.randomUUID()))
+   *   .spawn();
+   * ```
+   *
+   * Sync hooks always run before async hooks during a single resolution pass.
+   */
+  beforeCommandSync(callback: BeforeCommandSyncCallback): CommandBuilder {
+    return this.#newWithState((state) => {
+      state.beforeCommandSync = state.beforeCommandSync == null ? [callback] : [...state.beforeCommandSync, callback];
     });
   }
 
@@ -1959,6 +2110,42 @@ function captureCallerStack(skipUpTo: (...args: never[]) => unknown): string | u
   const holder: { stack?: string } = {};
   captureFn(holder, skipUpTo);
   return holder.stack;
+}
+
+// maps a non-thenable Proxy back to the real CommandBuilder it wraps
+const proxyToCommandBuilder = new WeakMap<CommandBuilder, CommandBuilder>();
+
+/** Wraps a `CommandBuilder` in a Proxy that hides `.then`, so it isn't detected
+ * as a thenable by Promise machinery. Methods that return another
+ * `CommandBuilder` (e.g. `.env(...)`) return a similarly wrapped Proxy, so
+ * chaining inside a `beforeCommand` callback stays "non-thenable" all the way
+ * through. Methods called on the proxy run with `this === target`, so private
+ * fields keep working. */
+function wrapCommandBuilderNonThenable(builder: CommandBuilder): CommandBuilder {
+  const proxy = new Proxy(builder, {
+    get(target, prop, _receiver) {
+      // hide `.then` so Promise.resolve / await don't see a thenable here
+      if (prop === "then") return undefined;
+      const value = Reflect.get(target, prop, target);
+      if (typeof value === "function") {
+        return (...args: unknown[]) => {
+          const result = (value as (...a: unknown[]) => unknown).apply(target, args);
+          if (result instanceof CommandBuilder) {
+            return wrapCommandBuilderNonThenable(result);
+          }
+          return result;
+        };
+      }
+      return value;
+    },
+  }) as CommandBuilder;
+  proxyToCommandBuilder.set(proxy, builder);
+  return proxy;
+}
+
+function unwrapCommandBuilder(result: unknown): CommandBuilder | undefined {
+  if (!(result instanceof CommandBuilder)) return undefined;
+  return proxyToCommandBuilder.get(result) ?? result;
 }
 
 function attachCallerStack(err: unknown, callerStack: string | undefined): void {
