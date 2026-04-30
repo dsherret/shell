@@ -7,11 +7,11 @@ export {
   escapeArg,
   KillController,
   KillSignal,
-  ShellError,
   type KillSignalListener,
   type NonRedirectTemplateExpr,
   RawArg,
   rawArg,
+  ShellError,
   type StreamKind,
   type TemplateExpr,
 } from "./src/command.ts";
