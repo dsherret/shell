@@ -14,6 +14,7 @@ import {
   createExecutableCommand,
   KillController,
   KillSignal,
+  ShellError,
   type Signal,
   whichRealEnv,
 } from "./mod.ts";
@@ -2943,9 +2944,28 @@ Deno.test("errorTail: surfaces captured stderr in the thrown error", async () =>
         .stderr("null")
         .errorTail();
     },
-    Error,
+    ShellError,
     "boom: missing config",
   );
+});
+
+Deno.test("errorTail: ShellError exposes structured properties", async () => {
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("stdout-data"); console.error("stderr-data"); Deno.exit(42);'`
+        .stdout("null")
+        .stderr("null")
+        .errorTail();
+    },
+    ShellError,
+  );
+  assertEquals(err.exitCode, 42);
+  assertEquals(err.timedOut, false);
+  assertEquals(err.aborted, false);
+  assertStringIncludes(err.stderr, "stderr-data");
+  assertStringIncludes(err.stdout, "stdout-data");
+  assert(err instanceof ShellError);
+  assert(err instanceof Error);
 });
 
 Deno.test("errorTail: includes both stdout and stderr when both have output", async () => {
@@ -2956,7 +2976,7 @@ Deno.test("errorTail: includes both stdout and stderr when both have output", as
         .stderr("null")
         .errorTail();
     },
-    Error,
+    ShellError,
   );
   assertStringIncludes(err.message, "stderr:\nstderr-line");
   assertStringIncludes(err.message, "stdout:\nstdout-line");
@@ -2969,7 +2989,7 @@ Deno.test("errorTail: omits stream labels when only one stream produced output",
         .stderr("null")
         .errorTail();
     },
-    Error,
+    ShellError,
   );
   // single stream → no "stderr:" label, just the bytes after the message
   assert(!err.message.includes("stderr:"));
@@ -2984,7 +3004,7 @@ Deno.test("errorTail: { stdout: false } disables stdout capture", async () => {
         .stderr("null")
         .errorTail({ stdout: false });
     },
-    Error,
+    ShellError,
   );
   assertStringIncludes(err.message, "stderr-line");
   assert(!err.message.includes("stdout-line"));
@@ -2999,7 +3019,7 @@ Deno.test("errorTail: caps captured output to maxBytes (oldest dropped)", async 
         .stderr("null")
         .errorTail({ maxBytes: 32 });
     },
-    Error,
+    ShellError,
   );
   // last lines should be present
   assertStringIncludes(err.message, "line-29");
@@ -3044,7 +3064,7 @@ Deno.test("errorTail: captures bytes flowing through a piped (CommandBuilder-as-
       while (!(await reader.read()).done) {}
       await child;
     },
-    Error,
+    ShellError,
     "piped-payload",
   );
 });
@@ -3058,7 +3078,7 @@ Deno.test("errorTail: works when stdout is sent to a WritableStream", async () =
         .stderr("null")
         .errorTail();
     },
-    Error,
+    ShellError,
     "captured-line",
   );
   // sanity: the bytes still reach the WritableStream — the tap is a mirror,
@@ -3081,7 +3101,7 @@ Deno.test("errorTail: skips capture for inherit streams (user already saw the by
         .stderr("inherit")
         .errorTail();
     },
-    Error,
+    ShellError,
   );
   assertStringIncludes(err.message, "stdout-line");
   assert(!err.message.includes("inherit-stderr-line"));
@@ -3097,7 +3117,7 @@ Deno.test("errorTail: explicit false disables a previously enabled capture", asy
         .errorTail()
         .errorTail(false);
     },
-    Error,
+    ShellError,
   );
   assert(!err.message.includes("should-not-appear"));
 });
@@ -3114,7 +3134,7 @@ Deno.test("errorTail: with stdout piped, surfaces the bytes in the error exactly
         .stdout("piped")
         .errorTail({ stdout: true, stderr: false });
     },
-    Error,
+    ShellError,
     "stdout-bytes",
   );
   assertStringIncludes(err.message, "Exited with code: 1");
@@ -3129,7 +3149,7 @@ Deno.test("errorTail: combined interleaves stdout and stderr into a single buffe
         .stderr("null")
         .errorTail({ combined: true });
     },
-    Error,
+    ShellError,
   );
   // combined mode: no stream labels, just interleaved output
   assert(!err.message.includes("stdout:"));
@@ -3147,7 +3167,7 @@ Deno.test("errorTail: combined with only one stream enabled captures just that s
         .stderr("null")
         .errorTail({ combined: true, stdout: false });
     },
-    Error,
+    ShellError,
   );
   assertStringIncludes(err.message, "err-only");
   assert(!err.message.includes("out-only"));

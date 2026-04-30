@@ -1292,15 +1292,14 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
               stdin.cancel();
             }
           }
-          let message: string;
-          if (timedOut) {
-            message = `Timed out with exit code: ${code}`;
-          } else if (signal.aborted) {
-            message = `${timedOut ? "Timed out" : "Aborted"} with exit code: ${code}`;
-          } else {
-            message = `Exited with code: ${code}`;
-          }
-          throw new Error(message + formatErrorTailSuffix(stdoutErrorRing, stderrErrorRing, combinedErrorRing));
+          throw new ShellError({
+            exitCode: code,
+            timedOut,
+            aborted: signal.aborted,
+            stdoutRing: stdoutErrorRing,
+            stderrRing: stderrErrorRing,
+            combinedRing: combinedErrorRing,
+          });
         }
       }
       for (const tw of tailWriters) tw.finalize();
@@ -1546,6 +1545,85 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   }
 }
 
+/** Error thrown when a command exits with a non-zero code (and `.noThrow()`
+ * is not set). Exposes structured properties (`exitCode`, `stdout`, `stderr`)
+ * so callers can inspect the failure programmatically. The human-readable
+ * `message` — including any captured error-tail output — is built lazily on
+ * first access so the formatting cost is skipped when the error is caught
+ * and only its properties are used. */
+export class ShellError extends Error {
+  override readonly name = "ShellError";
+  /** The process exit code. */
+  readonly exitCode: number;
+  /** Whether the command was killed because its timeout elapsed. */
+  readonly timedOut: boolean;
+  /** Whether the command was aborted via its kill signal. */
+  readonly aborted: boolean;
+  /** Captured trailing stdout text from the error-tail ring buffer.
+   * Empty string when stdout was not captured (e.g. routed to the
+   * terminal, or errorTail disabled for stdout). */
+  readonly stdout: string;
+  /** Captured trailing stderr text from the error-tail ring buffer.
+   * Empty string when stderr was not captured. */
+  readonly stderr: string;
+
+  #cachedMessage: string | undefined;
+  #baseMessage: string;
+
+  /** @internal */
+  constructor(options: {
+    exitCode: number;
+    timedOut: boolean;
+    aborted: boolean;
+    stdoutRing: ByteRingBuffer | undefined;
+    stderrRing: ByteRingBuffer | undefined;
+    combinedRing: ByteRingBuffer | undefined;
+  }) {
+    super();
+    this.exitCode = options.exitCode;
+    this.timedOut = options.timedOut;
+    this.aborted = options.aborted;
+    if (options.timedOut) {
+      this.#baseMessage = `Timed out with exit code: ${options.exitCode}`;
+    } else if (options.aborted) {
+      this.#baseMessage = `Aborted with exit code: ${options.exitCode}`;
+    } else {
+      this.#baseMessage = `Exited with code: ${options.exitCode}`;
+    }
+    // decode ring buffers eagerly into strings (cheap — bounded to maxBytes)
+    // so we can drop the ring references and expose simple string properties.
+    if (options.combinedRing != null && options.combinedRing.size > 0) {
+      // combined mode: both streams share a ring, so stdout and stderr
+      // contain the same interleaved text.
+      const combined = textDecoder.decode(options.combinedRing.toBytes());
+      this.stdout = combined;
+      this.stderr = combined;
+    } else {
+      this.stdout = options.stdoutRing != null && options.stdoutRing.size > 0
+        ? textDecoder.decode(options.stdoutRing.toBytes())
+        : "";
+      this.stderr = options.stderrRing != null && options.stderrRing.size > 0
+        ? textDecoder.decode(options.stderrRing.toBytes())
+        : "";
+    }
+    // delete the own `message` property set by `super()` so the prototype
+    // getter is reached instead.
+    delete (this as any).message;
+  }
+
+  override get message(): string {
+    if (this.#cachedMessage == null) {
+      this.#cachedMessage = this.#baseMessage + formatErrorTailSuffix(this.stdout, this.stderr);
+    }
+    return this.#cachedMessage;
+  }
+
+  override set message(value: string) {
+    // allow external mutation (e.g. attachCallerStack modifying .stack)
+    this.#cachedMessage = value;
+  }
+}
+
 /** Result of running a command. */
 export class CommandResult {
   #stdout: BufferStdio;
@@ -1716,22 +1794,19 @@ function wrapWithErrorTailCapture(
   return new ErrorTailCaptureWriterSync(inner, ring);
 }
 
-/** Decode a captured ring buffer back to text and produce the suffix
- * appended to the thrown `Error.message`. Returns `""` when both rings
- * are empty (or absent), so the error message stays unchanged in cases
- * where the failed command never wrote anything. */
+/** Format the suffix appended to the error message from the already-decoded
+ * stdout/stderr strings. When both reference the same string (combined mode),
+ * the output is rendered without stream labels. Returns `""` when both are
+ * empty. */
 function formatErrorTailSuffix(
-  stdoutRing: ByteRingBuffer | undefined,
-  stderrRing: ByteRingBuffer | undefined,
-  combinedRing: ByteRingBuffer | undefined,
+  stdoutText: string,
+  stderrText: string,
 ): string {
-  if (combinedRing != null) {
-    if (combinedRing.size === 0) return "";
-    return `\n\n${stripTrailingNewline(textDecoder.decode(combinedRing.toBytes()))}`;
-  }
-  const stdoutText = stdoutRing != null && stdoutRing.size > 0 ? textDecoder.decode(stdoutRing.toBytes()) : "";
-  const stderrText = stderrRing != null && stderrRing.size > 0 ? textDecoder.decode(stderrRing.toBytes()) : "";
   if (stdoutText.length === 0 && stderrText.length === 0) return "";
+  // combined mode: both properties point to the same interleaved string
+  if (stdoutText === stderrText) {
+    return `\n\n${stripTrailingNewline(stdoutText)}`;
+  }
   // when only one stream has content, surface it without a label so the
   // common case (just stderr) reads naturally. when both have content,
   // prefix each so the reader can tell which is which.

@@ -7,6 +7,7 @@ export {
   escapeArg,
   KillController,
   KillSignal,
+  ShellError,
   type KillSignalListener,
   type NonRedirectTemplateExpr,
   RawArg,
