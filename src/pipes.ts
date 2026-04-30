@@ -14,6 +14,7 @@ import { Buffer } from "@std/io/buffer";
 import { writeAll, writeAllSync } from "@std/io/write-all";
 import type { CommandBuilder, KillSignal } from "./command.ts";
 import { abortSignalToPromise } from "./common.ts";
+import type { ByteRingBuffer } from "./byteRingBuffer.ts";
 import { LineRingBuffer } from "./lineRingBuffer.ts";
 import type { Closer, Reader, ReaderSync, Writer, WriterSync } from "@std/io/types";
 import type { CommandPipeWriter } from "./commandHandler.ts";
@@ -255,6 +256,45 @@ export class CapturingBufferWriterSync implements WriterSync {
   }
 }
 
+/** Async tap that mirrors writes into a {@link ByteRingBuffer} for use as
+ * "errorTail" — the ring keeps the trailing N bytes of whatever the
+ * command sent through this stream, so they can be surfaced in the thrown
+ * `Error` even when the underlying sink (a piped command, a `WritableStream`,
+ * a file on disk) doesn't expose what was written. Pairs with
+ * {@link ErrorTailCaptureWriterSync}. */
+export class ErrorTailCaptureWriter implements Writer {
+  readonly ring: ByteRingBuffer;
+  #innerWriter: Writer;
+
+  constructor(innerWriter: Writer, ring: ByteRingBuffer) {
+    this.#innerWriter = innerWriter;
+    this.ring = ring;
+  }
+
+  async write(p: Uint8Array): Promise<number> {
+    const nWritten = await this.#innerWriter.write(p);
+    this.ring.push(p.subarray(0, nWritten));
+    return nWritten;
+  }
+}
+
+/** Sync variant of {@link ErrorTailCaptureWriter}. */
+export class ErrorTailCaptureWriterSync implements WriterSync {
+  readonly ring: ByteRingBuffer;
+  #innerWriter: WriterSync;
+
+  constructor(innerWriter: WriterSync, ring: ByteRingBuffer) {
+    this.#innerWriter = innerWriter;
+    this.ring = ring;
+  }
+
+  writeSync(p: Uint8Array): number {
+    const nWritten = this.#innerWriter.writeSync(p);
+    this.ring.push(p.subarray(0, nWritten));
+    return nWritten;
+  }
+}
+
 const lineFeedCharCode = "\n".charCodeAt(0);
 
 export class InheritStaticTextBypassWriter implements WriterSync {
@@ -366,10 +406,45 @@ export interface InheritTailWriterOptions {
   headerVerbatim?: boolean;
   /** Always-shown command label on the error scrollback path, even when
    * `header` is hidden or customized. */
-  errorContext?: string;
+  errorHeader?: string;
   /** When true, promote the header to scrollback as `Ran <cmd>` (or the
    * verbatim header) on success — typically wired to `.printCommand()`. */
   promoteHeaderOnSuccess?: boolean;
+}
+
+/**
+ * Default size of the per-stream error-context ring buffer. 8 KiB is enough
+ * to capture the last few screens worth of output — large enough to convey
+ * what went wrong without ballooning memory for long-running commands.
+ */
+export const DEFAULT_ERROR_TAIL_BYTES = 8 * 1024;
+
+/**
+ * Configuration for `.errorTail()`. When enabled, dax silently retains
+ * the trailing N bytes of stdout and/or stderr and appends them to the
+ * thrown `Error.message` if the command exits with a non-zero code.
+ * Targets streams the user can't see — piped to another command,
+ * redirected to a file, sent to a `WritableStream`, or discarded with
+ * `"null"`. Streams routed to the terminal (`"inherit"` /
+ * `"inheritPiped"`) are skipped since the bytes already reached the
+ * user's scrollback.
+ */
+export interface ErrorTailOptions {
+  /** Per-stream cap on retained bytes. Once exceeded, the oldest bytes
+   * are dropped first.
+   * @default 8192 (8 KiB) */
+  maxBytes?: number;
+  /** Capture the trailing bytes of stdout.
+   * @default true */
+  stdout?: boolean;
+  /** Capture the trailing bytes of stderr.
+   * @default true */
+  stderr?: boolean;
+  /** Capture stdout and stderr into a single interleaved buffer instead
+   * of separate per-stream buffers. When true, the error message shows
+   * output in the order it was written rather than grouped by stream.
+   * @default false */
+  combined?: boolean;
 }
 
 /**
@@ -423,7 +498,7 @@ function makeMaxLinesResolver(value: TailMaxLines): ResolvedMaxLinesFn {
 }
 
 /** Collapse whitespace and trim, returning `undefined` for empty input.
- * Shared by header and errorContext so both have the same single-line shape. */
+ * Shared by header and errorHeader so both have the same single-line shape. */
 function normalizeHeaderText(text: string | undefined): string | undefined {
   if (text == null) return undefined;
   const trimmed = text.replace(/\s+/g, " ").trim();
@@ -458,7 +533,7 @@ class InheritTailState {
   /** Always-present fallback shown on the error path, even if the live
    * header is hidden or customized — so error scrollback is unambiguous
    * about which command failed. */
-  errorContext: string | undefined;
+  errorHeader: string | undefined;
   promoteHeaderOnSuccess = false;
   #refCount = 0;
   #disposed = false;
@@ -551,11 +626,11 @@ class InheritTailState {
       // emit the raw command on error so scrollback always records which
       // command failed — in the same `> <cmd>` format the default
       // printCommand logger uses, so both renderings look uniform. prefer
-      // `errorContext` (the raw command) over the live header so a custom
+      // `errorHeader` (the raw command) over the live header so a custom
       // or hidden header doesn't leave error logs ambiguous; if neither is
       // set, fall back to the live header text.
-      if (this.errorContext != null) {
-        preserved.push(`${colors.white(">")} ${colors.blue(this.errorContext)}`);
+      if (this.errorHeader != null) {
+        preserved.push(`${colors.white(">")} ${colors.blue(this.errorHeader)}`);
       } else if (this.headerFn != null) {
         const headerFn = this.headerFn;
         preserved.push((size) => `${colors.white(">")} ${colors.blue(headerFn({ size }))}`);
@@ -628,8 +703,8 @@ export class InheritTailWriter implements WriterSync, Disposable {
       if (opts.header !== undefined) {
         state.setHeader(opts.header, { verbatim: opts.headerVerbatim });
       }
-      if (opts.errorContext !== undefined) {
-        state.errorContext = normalizeHeaderText(opts.errorContext);
+      if (opts.errorHeader !== undefined) {
+        state.errorHeader = normalizeHeaderText(opts.errorHeader);
       }
       if (opts.promoteHeaderOnSuccess !== undefined) {
         state.promoteHeaderOnSuccess = opts.promoteHeaderOnSuccess;
@@ -679,8 +754,8 @@ export class InheritTailWriter implements WriterSync, Disposable {
    * always shown when a tailed command fails, regardless of `.tailDisplay`
    * header config.
    */
-  setErrorContext(text: string | undefined): void {
-    this.#state.errorContext = normalizeHeaderText(text);
+  setErrorHeader(text: string | undefined): void {
+    this.#state.errorHeader = normalizeHeaderText(text);
   }
 
   /**

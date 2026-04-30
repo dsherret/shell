@@ -35,10 +35,15 @@ import {
 } from "./common.ts";
 import type { Signal } from "./signal.ts";
 import { stderr as stderrStream, stdout as stdoutStream } from "./streams.ts";
+import { ByteRingBuffer } from "./byteRingBuffer.ts";
 import {
   type AwaitableReadable,
   CapturingBufferWriter,
   CapturingBufferWriterSync,
+  DEFAULT_ERROR_TAIL_BYTES,
+  ErrorTailCaptureWriter,
+  ErrorTailCaptureWriterSync,
+  type ErrorTailOptions,
   InheritStaticTextBypassWriter,
   InheritTailWriter,
   type InheritTailWriterOptions,
@@ -93,6 +98,7 @@ interface CommandBuilderState {
   stdout: ShellPipeWriterKindWithOptions;
   stderr: ShellPipeWriterKindWithOptions;
   tailDisplay: false | TailDisplayOptions;
+  errorTail: false | ErrorTailOptions;
   noThrow: boolean | number[];
   env: Record<string, string | undefined>;
   commands: Record<string, CommandHandler>;
@@ -207,6 +213,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       kind: "inherit",
     },
     tailDisplay: false,
+    errorTail: false,
     noThrow: false,
     env: {},
     cwd: undefined,
@@ -242,6 +249,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         options: state.stderr.options,
       },
       tailDisplay: state.tailDisplay === false ? false : { ...state.tailDisplay },
+      errorTail: state.errorTail === false ? false : { ...state.errorTail },
       noThrow: state.noThrow instanceof Array ? [...state.noThrow] : state.noThrow,
       env: { ...state.env },
       cwd: state.cwd,
@@ -625,6 +633,46 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         state.tailDisplay = {};
       } else {
         state.tailDisplay = { ...valueOrOptions };
+      }
+    });
+  }
+
+  /**
+   * Silently retains the trailing N bytes of stdout and/or stderr and
+   * appends them to the thrown `Error.message` if the command exits with
+   * a non-zero code. Targets the case where the stream is going somewhere
+   * the user can't see — piped to another command, redirected to a file,
+   * sent to a `WritableStream`, or discarded with `"null"` — so they
+   * still get a glimpse of what was written when the command fails.
+   *
+   * Streams routed to the terminal (`"inherit"` / `"inheritPiped"`) are
+   * skipped: the user already watched those bytes scroll by, so adding
+   * them to the error message would just be noise.
+   *
+   * Has no effect when the command succeeds (the buffer is discarded) or
+   * when `.noThrow()` swallows the failure.
+   *
+   * @example
+   * ```ts
+   * // when stdout is being captured for the return value (.text(),
+   * // .json(), .bytes(), etc.), errorTail surfaces it in the thrown
+   * // error if the command fails — without it the captured bytes vanish
+   * // along with the result you never got.
+   * const output = await $`./build.sh`.errorTail().text();
+   * const output = await $`./build.sh`.errorTail({ maxBytes: 16 * 1024 }).text();
+   * ```
+   */
+  errorTail(value?: boolean): CommandBuilder;
+  /** Enables errorTail capture with the provided options. */
+  errorTail(options: ErrorTailOptions): CommandBuilder;
+  errorTail(valueOrOptions: boolean | ErrorTailOptions = true): CommandBuilder {
+    return this.#newWithState((state) => {
+      if (valueOrOptions === false) {
+        state.errorTail = false;
+      } else if (valueOrOptions === true) {
+        state.errorTail = {};
+      } else {
+        state.errorTail = { ...valueOrOptions };
       }
     });
   }
@@ -1150,29 +1198,67 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     });
   }
   // resolve tail config up front so the InheritTailWriter is constructed in
-  // its final state — applying header/errorContext/promote AFTER the writer
+  // its final state — applying header/errorHeader/promote AFTER the writer
   // has registered with the renderer can leave a one-tick window where the
   // pinned region paints without a header.
   const resolvedTailWriterOptions = state.tailDisplay !== false
     ? resolveTailWriterOptions(state.tailDisplay, state.command.text, Boolean(state.printCommand))
     : undefined;
   const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
-  // when tailDisplay is on for an `"inherit"` stream we need Node's spawn
-  // to pipe the child's output through us instead of connecting the child
-  // directly to the parent's fd (which would bypass the InheritTailWriter
-  // entirely). report the kind as `"inheritPiped"` at the shell level so
-  // the executable handler reads from the pipe and forwards bytes through
-  // our writer chain. user-facing `state.stdout.kind` stays `"inherit"`.
+  // ring buffers retaining the trailing N bytes of each captured stream so
+  // they can be appended to the thrown error message. allocated up front
+  // (before the writer chain is built) so the tap can be inserted between
+  // ShellPipeWriter and whatever the inner sink is — this is what makes
+  // the capture work even when the user piped output to a child command,
+  // a file, or a WritableStream where they otherwise wouldn't see it.
+  // skipped for terminal-bound streams ("inherit" / "inheritPiped") since
+  // the user already watched those bytes scroll by — surfacing them again
+  // in the error would just be noise.
+  const errorTail = state.errorTail;
+  const errorTailMaxBytes = errorTail === false ? 0 : errorTail.maxBytes ?? DEFAULT_ERROR_TAIL_BYTES;
+  const errorTailCombined = errorTail !== false && errorTail.combined === true;
+  const captureStdout = shouldCaptureForErrorTail(errorTail, "stdout", state.stdout.kind);
+  const captureStderr = shouldCaptureForErrorTail(errorTail, "stderr", state.stderr.kind);
+  let stdoutErrorRing: ByteRingBuffer | undefined;
+  let stderrErrorRing: ByteRingBuffer | undefined;
+  let combinedErrorRing: ByteRingBuffer | undefined;
+  if (errorTailCombined && (captureStdout || captureStderr)) {
+    combinedErrorRing = new ByteRingBuffer(errorTailMaxBytes);
+    if (captureStdout) stdoutErrorRing = combinedErrorRing;
+    if (captureStderr) stderrErrorRing = combinedErrorRing;
+  } else {
+    if (captureStdout) stdoutErrorRing = new ByteRingBuffer(errorTailMaxBytes);
+    if (captureStderr) stderrErrorRing = new ByteRingBuffer(errorTailMaxBytes);
+  }
+  // when tailDisplay or errorTail needs to tap a stream that would
+  // otherwise bypass our writer chain (an "inherit" stream connects the
+  // child directly to the parent's fd; a "null" stream wires the child to
+  // /dev/null at the OS level), force the shell-level kind to a piped
+  // variant so the executable handler reads bytes back through our chain
+  // and our wrapped writer (which forwards to stdoutStream / NullPipeWriter
+  // as appropriate) gets a chance to see them. user-facing
+  // `state.stdout.kind` stays unchanged so callers observing the builder
+  // see what they configured.
   const tailEnabled = state.tailDisplay !== false;
-  const stdoutShellKind = tailEnabled && state.stdout.kind === "inherit" ? "inheritPiped" as const : state.stdout.kind;
-  const stderrShellKind = tailEnabled && state.stderr.kind === "inherit" ? "inheritPiped" as const : state.stderr.kind;
+  const stdoutShellKind = resolveShellKind(state.stdout.kind, tailEnabled, stdoutErrorRing != null);
+  const stderrShellKind = resolveShellKind(state.stderr.kind, tailEnabled, stderrErrorRing != null);
+  const stdoutInner = stdoutBuffer === "null"
+    ? new NullPipeWriter()
+    : stdoutBuffer === "inherit"
+    ? stdoutStream
+    : stdoutBuffer;
+  const stderrInner = stderrBuffer === "null"
+    ? new NullPipeWriter()
+    : stderrBuffer === "inherit"
+    ? stderrStream
+    : stderrBuffer;
   const stdout = new ShellPipeWriter(
     stdoutShellKind,
-    stdoutBuffer === "null" ? new NullPipeWriter() : stdoutBuffer === "inherit" ? stdoutStream : stdoutBuffer,
+    stdoutErrorRing != null ? wrapWithErrorTailCapture(stdoutInner, stdoutErrorRing) : stdoutInner,
   );
   const stderr = new ShellPipeWriter(
     stderrShellKind,
-    stderrBuffer === "null" ? new NullPipeWriter() : stderrBuffer === "inherit" ? stderrStream : stderrBuffer,
+    stderrErrorRing != null ? wrapWithErrorTailCapture(stderrInner, stderrErrorRing) : stderrInner,
   );
   const { text: commandText, fds } = state.command;
   const signal = killSignalController.signal;
@@ -1206,13 +1292,14 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
               stdin.cancel();
             }
           }
-          if (timedOut) {
-            throw new Error(`Timed out with exit code: ${code}`);
-          } else if (signal.aborted) {
-            throw new Error(`${timedOut ? "Timed out" : "Aborted"} with exit code: ${code}`);
-          } else {
-            throw new Error(`Exited with code: ${code}`);
-          }
+          throw new ShellError({
+            exitCode: code,
+            timedOut,
+            aborted: signal.aborted,
+            stdoutRing: stdoutErrorRing,
+            stderrRing: stderrErrorRing,
+            combinedRing: combinedErrorRing,
+          });
         }
       }
       for (const tw of tailWriters) tw.finalize();
@@ -1458,6 +1545,85 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   }
 }
 
+/** Error thrown when a command exits with a non-zero code (and `.noThrow()`
+ * is not set). Exposes structured properties (`exitCode`, `stdout`, `stderr`)
+ * so callers can inspect the failure programmatically. The human-readable
+ * `message` — including any captured error-tail output — is built lazily on
+ * first access so the formatting cost is skipped when the error is caught
+ * and only its properties are used. */
+export class ShellError extends Error {
+  override readonly name = "ShellError";
+  /** The process exit code. */
+  readonly exitCode: number;
+  /** Whether the command was killed because its timeout elapsed. */
+  readonly timedOut: boolean;
+  /** Whether the command was aborted via its kill signal. */
+  readonly aborted: boolean;
+  /** Captured trailing stdout text from the error-tail ring buffer.
+   * Empty string when stdout was not captured (e.g. routed to the
+   * terminal, or errorTail disabled for stdout). */
+  readonly stdout: string;
+  /** Captured trailing stderr text from the error-tail ring buffer.
+   * Empty string when stderr was not captured. */
+  readonly stderr: string;
+
+  #cachedMessage: string | undefined;
+  #baseMessage: string;
+
+  /** @internal */
+  constructor(options: {
+    exitCode: number;
+    timedOut: boolean;
+    aborted: boolean;
+    stdoutRing: ByteRingBuffer | undefined;
+    stderrRing: ByteRingBuffer | undefined;
+    combinedRing: ByteRingBuffer | undefined;
+  }) {
+    super();
+    this.exitCode = options.exitCode;
+    this.timedOut = options.timedOut;
+    this.aborted = options.aborted;
+    if (options.timedOut) {
+      this.#baseMessage = `Timed out with exit code: ${options.exitCode}`;
+    } else if (options.aborted) {
+      this.#baseMessage = `Aborted with exit code: ${options.exitCode}`;
+    } else {
+      this.#baseMessage = `Exited with code: ${options.exitCode}`;
+    }
+    // decode ring buffers eagerly into strings (cheap — bounded to maxBytes)
+    // so we can drop the ring references and expose simple string properties.
+    if (options.combinedRing != null && options.combinedRing.size > 0) {
+      // combined mode: both streams share a ring, so stdout and stderr
+      // contain the same interleaved text.
+      const combined = textDecoder.decode(options.combinedRing.toBytes());
+      this.stdout = combined;
+      this.stderr = combined;
+    } else {
+      this.stdout = options.stdoutRing != null && options.stdoutRing.size > 0
+        ? textDecoder.decode(options.stdoutRing.toBytes())
+        : "";
+      this.stderr = options.stderrRing != null && options.stderrRing.size > 0
+        ? textDecoder.decode(options.stderrRing.toBytes())
+        : "";
+    }
+    // delete the own `message` property set by `super()` so the prototype
+    // getter is reached instead.
+    delete (this as any).message;
+  }
+
+  override get message(): string {
+    if (this.#cachedMessage == null) {
+      this.#cachedMessage = this.#baseMessage + formatErrorTailSuffix(this.stdout, this.stderr);
+    }
+    return this.#cachedMessage;
+  }
+
+  override set message(value: string) {
+    // allow external mutation (e.g. attachCallerStack modifying .stack)
+    this.#cachedMessage = value;
+  }
+}
+
 /** Result of running a command. */
 export class CommandResult {
   #stdout: BufferStdio;
@@ -1580,6 +1746,88 @@ export class CommandResult {
   }
 }
 
+/** Decide whether errorTail should capture the trailing bytes of a
+ * given stream. Skipped when the user disabled it for this stream and
+ * when the stream is going to the user's terminal — for "inherit" /
+ * "inheritPiped" they already saw the bytes, so duplicating them in the
+ * error message would just be noise. */
+function shouldCaptureForErrorTail(
+  errorTail: false | ErrorTailOptions,
+  stream: "stdout" | "stderr",
+  kind: ShellPipeWriterKind,
+): boolean {
+  if (errorTail === false) return false;
+  if (errorTail[stream] === false) return false;
+  if (kind === "inherit" || kind === "inheritPiped") return false;
+  return true;
+}
+
+/** Resolve the shell-level pipe kind given the user-facing kind and whether
+ * any tap (tailDisplay / errorTail) needs the bytes to flow through our
+ * writer chain. "inherit" and "null" both bypass our chain at the OS level,
+ * so they need to be promoted to a piped variant when something will tap
+ * them. tailDisplay can only tap "inherit" (canTail rejects "null"), so
+ * "null" is only promoted when errorTail is capturing this stream —
+ * otherwise the OS-level discard stays the fast path. */
+function resolveShellKind(
+  userKind: ShellPipeWriterKind,
+  tailEnabled: boolean,
+  errorTailEnabled: boolean,
+): ShellPipeWriterKind {
+  if (!tailEnabled && !errorTailEnabled) return userKind;
+  if (userKind === "inherit") return "inheritPiped";
+  if (userKind === "null" && errorTailEnabled) return "piped";
+  return userKind;
+}
+
+/** Wrap a writer with the right sync/async error-context tap based on
+ * whether the inner exposes async `write` or sync `writeSync` — mirrors
+ * the same dispatch `ShellPipeWriter.write` uses, so the wrapper appears
+ * to be the same kind of writer as its inner. */
+function wrapWithErrorTailCapture(
+  inner: Writer | WriterSync,
+  ring: ByteRingBuffer,
+): Writer | WriterSync {
+  if ("write" in inner) {
+    return new ErrorTailCaptureWriter(inner, ring);
+  }
+  return new ErrorTailCaptureWriterSync(inner, ring);
+}
+
+/** Format the suffix appended to the error message from the already-decoded
+ * stdout/stderr strings. When both reference the same string (combined mode),
+ * the output is rendered without stream labels. Returns `""` when both are
+ * empty. */
+function formatErrorTailSuffix(
+  stdoutText: string,
+  stderrText: string,
+): string {
+  if (stdoutText.length === 0 && stderrText.length === 0) return "";
+  // combined mode: both properties point to the same interleaved string
+  if (stdoutText === stderrText) {
+    return `\n\n${stripTrailingNewline(stdoutText)}`;
+  }
+  // when only one stream has content, surface it without a label so the
+  // common case (just stderr) reads naturally. when both have content,
+  // prefix each so the reader can tell which is which.
+  let suffix = "";
+  if (stderrText.length > 0 && stdoutText.length > 0) {
+    suffix += `\n\nstderr:\n${stripTrailingNewline(stderrText)}`;
+    suffix += `\n\nstdout:\n${stripTrailingNewline(stdoutText)}`;
+  } else if (stderrText.length > 0) {
+    suffix += `\n\n${stripTrailingNewline(stderrText)}`;
+  } else {
+    suffix += `\n\n${stripTrailingNewline(stdoutText)}`;
+  }
+  return suffix;
+}
+
+function stripTrailingNewline(text: string): string {
+  if (text.endsWith("\r\n")) return text.slice(0, -2);
+  if (text.endsWith("\n")) return text.slice(0, -1);
+  return text;
+}
+
 /** Translate the user-facing `TailDisplayOptions` plus the surrounding
  * command context into the constructor-ready shape `InheritTailWriter`
  * expects. The user's `header` callback (if any) is pre-bound with the
@@ -1608,7 +1856,7 @@ function resolveTailWriterOptions(
     maxLines: display.maxLines,
     header,
     headerVerbatim,
-    errorContext: command,
+    errorHeader: command,
     promoteHeaderOnSuccess,
   };
 }

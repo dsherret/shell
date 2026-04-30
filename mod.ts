@@ -11,6 +11,7 @@ export {
   type NonRedirectTemplateExpr,
   RawArg,
   rawArg,
+  ShellError,
   type StreamKind,
   type TemplateExpr,
 } from "./src/command.ts";
@@ -18,6 +19,7 @@ export type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWrit
 export {
   type AwaitableReadable,
   type Closer,
+  type ErrorTailOptions,
   type Reader,
   type ShellPipeReaderKind,
   type ShellPipeWriterKind,
