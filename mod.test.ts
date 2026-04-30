@@ -2933,3 +2933,190 @@ Deno.test("beforeCommandSync: a hook that returns nothing is a no-op", async () 
   const result = await $`echo hello`.beforeCommandSync(() => {}).text();
   assertEquals(result, "hello");
 });
+
+Deno.test("errorContext: surfaces captured stderr in the thrown error", async () => {
+  // stderr goes to "null" so the test output stays clean; the errorContext
+  // tap captures the bytes regardless of where the stream is sent.
+  await assertRejects(
+    async () => {
+      await $`deno eval 'console.error("boom: missing config"); Deno.exit(1);'`
+        .stderr("null")
+        .errorContext();
+    },
+    Error,
+    "boom: missing config",
+  );
+});
+
+Deno.test("errorContext: includes both stdout and stderr when both have output", async () => {
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("stdout-line"); console.error("stderr-line"); Deno.exit(1);'`
+        .stdout("null")
+        .stderr("null")
+        .errorContext();
+    },
+    Error,
+  );
+  assertStringIncludes(err.message, "stderr:\nstderr-line");
+  assertStringIncludes(err.message, "stdout:\nstdout-line");
+});
+
+Deno.test("errorContext: omits stream labels when only one stream produced output", async () => {
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.error("only stderr"); Deno.exit(1);'`
+        .stderr("null")
+        .errorContext();
+    },
+    Error,
+  );
+  // single stream → no "stderr:" label, just the bytes after the message
+  assert(!err.message.includes("stderr:"));
+  assertStringIncludes(err.message, "only stderr");
+});
+
+Deno.test("errorContext: { stdout: false } disables stdout capture", async () => {
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("stdout-line"); console.error("stderr-line"); Deno.exit(1);'`
+        .stdout("null")
+        .stderr("null")
+        .errorContext({ stdout: false });
+    },
+    Error,
+  );
+  assertStringIncludes(err.message, "stderr-line");
+  assert(!err.message.includes("stdout-line"));
+});
+
+Deno.test("errorContext: caps captured output to maxBytes (oldest dropped)", async () => {
+  // produce ~300 bytes on stderr, then cap to 32 — only the trailing bytes
+  // should make it into the error message
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'for (let i = 0; i < 30; i++) console.error("line-" + i.toString().padStart(2, "0")); Deno.exit(1);'`
+        .stderr("null")
+        .errorContext({ maxBytes: 32 });
+    },
+    Error,
+  );
+  // last lines should be present
+  assertStringIncludes(err.message, "line-29");
+  // earliest lines should be dropped
+  assert(!err.message.includes("line-00"));
+});
+
+Deno.test("errorContext: does not modify the error on success", async () => {
+  // success path discards the captured buffer entirely — the result resolves
+  // normally and `.errorContext()` is a no-op for non-failing commands.
+  const result = await $`deno eval 'console.error("noisy but ok");'`
+    .stderr("null")
+    .errorContext()
+    .noThrow();
+  assertEquals(result.code, 0);
+});
+
+Deno.test("errorContext: noThrow swallows the failure, no error is thrown", async () => {
+  // when noThrow is set, we never enter the error path, so the captured
+  // bytes are simply dropped — no error means nowhere to surface them.
+  const result = await $`deno eval 'console.error("ignored"); Deno.exit(2);'`
+    .stderr("null")
+    .errorContext()
+    .noThrow();
+  assertEquals(result.code, 2);
+});
+
+Deno.test("errorContext: captures bytes flowing through a piped (CommandBuilder-as-stdin) producer", async () => {
+  // models the issue #172 scenario at the producer level: when a command's
+  // stdout feeds another command, errorContext on the producer must still
+  // tap the bytes flowing through the pipe. drain the readable inside the
+  // assertRejects body so the producer's rejection is the one observed
+  // (cat's promise would reflect cat's exit, not the producer's).
+  await assertRejects(
+    async () => {
+      const child = $`deno eval 'console.log("piped-payload"); Deno.exit(1);'`
+        .errorContext()
+        .stdout("piped")
+        .spawn();
+      const reader = child.stdout().getReader();
+      // deno-lint-ignore no-empty
+      while (!(await reader.read()).done) {}
+      await child;
+    },
+    Error,
+    "piped-payload",
+  );
+});
+
+Deno.test("errorContext: works when stdout is sent to a WritableStream", async () => {
+  const sink = new Buffer();
+  await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("captured-line"); Deno.exit(1);'`
+        .stdout(toWritableStream(sink))
+        .stderr("null")
+        .errorContext();
+    },
+    Error,
+    "captured-line",
+  );
+  // sanity: the bytes still reach the WritableStream — the tap is a mirror,
+  // not a redirect.
+  assertEquals(new TextDecoder().decode(sink.bytes()), "captured-line\n");
+});
+
+Deno.test("errorContext: skips capture for inherit streams (user already saw the bytes)", async () => {
+  // when the failing command's output went to the terminal, the bytes are
+  // already in the user's scrollback — duplicating them in the error
+  // message would just be noise, so errorContext is a no-op for inherit
+  // streams. stderr is "inherit" here so its bytes must NOT show up in
+  // the error message; stdout is "null" so it's captured normally.
+  // (the inherit-stderr-line below will appear in test output as a
+  // side effect — that's the inherit behavior we're verifying.)
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("stdout-line"); console.error("inherit-stderr-line"); Deno.exit(1);'`
+        .stdout("null")
+        .stderr("inherit")
+        .errorContext();
+    },
+    Error,
+  );
+  assertStringIncludes(err.message, "stdout-line");
+  assert(!err.message.includes("inherit-stderr-line"));
+});
+
+Deno.test("errorContext: explicit false disables a previously enabled capture", async () => {
+  // builder is immutable: each call returns a new builder, so chaining
+  // .errorContext().errorContext(false) should leave capture off.
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.error("should-not-appear"); Deno.exit(1);'`
+        .stderr("null")
+        .errorContext()
+        .errorContext(false);
+    },
+    Error,
+  );
+  assert(!err.message.includes("should-not-appear"));
+});
+
+Deno.test("errorContext: with stdout piped, surfaces the bytes in the error exactly once", async () => {
+  // when stdout is "piped" (captured into the result buffer), errorContext
+  // also captures it. callers of .text() etc. don't use errorContext so this
+  // is fine — but verify the bytes show up for users who go
+  // .stderr("piped") + .errorContext() to grab both in one shot, and that
+  // they appear exactly once (no double-inclusion from overlapping taps).
+  const err = await assertRejects(
+    async () => {
+      await $`deno eval 'console.log("stdout-bytes"); Deno.exit(1);'`
+        .stdout("piped")
+        .errorContext({ stdout: true, stderr: false });
+    },
+    Error,
+    "stdout-bytes",
+  );
+  assertStringIncludes(err.message, "Exited with code: 1");
+  assertEquals(err.message.match(/stdout-bytes/g)?.length, 1);
+});

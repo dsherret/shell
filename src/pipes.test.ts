@@ -322,14 +322,14 @@ Deno.test("verbatim header truncates to terminal width with an ellipsis", () => 
   assertStringIncludes(out, "a".repeat(11) + "…");
 });
 
-Deno.test("error path uses errorContext when the live header is hidden", () => {
+Deno.test("error path uses errorHeader when the live header is hidden", () => {
   using fixture = createTailFixture({ rows: 40, columns: 60 });
   using writer = new InheritTailWriter(new Buffer(), { maxLines: 3, isTty: true, renderer: fixture.renderer });
-  // user opted into `header: false` (no live label) — but errorContext still
+  // user opted into `header: false` (no live label) — but errorHeader still
   // surfaces the raw command on the error scrollback path so logs aren't
   // ambiguous about which command failed.
   writer.setHeader(undefined);
-  writer.setErrorContext("npm run build");
+  writer.setErrorHeader("npm run build");
   writer.writeSync(encoder.encode("oh no\n"));
   fixture.flushPlain();
 
@@ -465,7 +465,7 @@ Deno.test("success-side pending bytes survive into a sibling's error scrollback"
     maxLines: 3,
     isTty: true,
     renderer: fixture.renderer,
-    errorContext: "build",
+    errorHeader: "build",
   });
   using stderr = new InheritTailWriter(new Buffer(), stdout);
 

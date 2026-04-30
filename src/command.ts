@@ -35,10 +35,15 @@ import {
 } from "./common.ts";
 import type { Signal } from "./signal.ts";
 import { stderr as stderrStream, stdout as stdoutStream } from "./streams.ts";
+import { ByteRingBuffer } from "./byteRingBuffer.ts";
 import {
   type AwaitableReadable,
   CapturingBufferWriter,
   CapturingBufferWriterSync,
+  DEFAULT_ERROR_CONTEXT_BYTES,
+  ErrorContextCaptureWriter,
+  ErrorContextCaptureWriterSync,
+  type ErrorContextOptions,
   InheritStaticTextBypassWriter,
   InheritTailWriter,
   type InheritTailWriterOptions,
@@ -93,6 +98,7 @@ interface CommandBuilderState {
   stdout: ShellPipeWriterKindWithOptions;
   stderr: ShellPipeWriterKindWithOptions;
   tailDisplay: false | TailDisplayOptions;
+  errorContext: false | ErrorContextOptions;
   noThrow: boolean | number[];
   env: Record<string, string | undefined>;
   commands: Record<string, CommandHandler>;
@@ -207,6 +213,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       kind: "inherit",
     },
     tailDisplay: false,
+    errorContext: false,
     noThrow: false,
     env: {},
     cwd: undefined,
@@ -242,6 +249,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         options: state.stderr.options,
       },
       tailDisplay: state.tailDisplay === false ? false : { ...state.tailDisplay },
+      errorContext: state.errorContext === false ? false : { ...state.errorContext },
       noThrow: state.noThrow instanceof Array ? [...state.noThrow] : state.noThrow,
       env: { ...state.env },
       cwd: state.cwd,
@@ -625,6 +633,46 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         state.tailDisplay = {};
       } else {
         state.tailDisplay = { ...valueOrOptions };
+      }
+    });
+  }
+
+  /**
+   * Silently retains the trailing N bytes of stdout and/or stderr and
+   * appends them to the thrown `Error.message` if the command exits with
+   * a non-zero code. Targets the case where the stream is going somewhere
+   * the user can't see — piped to another command, redirected to a file,
+   * sent to a `WritableStream`, or discarded with `"null"` — so they
+   * still get a glimpse of what was written when the command fails.
+   *
+   * Streams routed to the terminal (`"inherit"` / `"inheritPiped"`) are
+   * skipped: the user already watched those bytes scroll by, so adding
+   * them to the error message would just be noise.
+   *
+   * Has no effect when the command succeeds (the buffer is discarded) or
+   * when `.noThrow()` swallows the failure.
+   *
+   * @example
+   * ```ts
+   * // when stdout is being captured for the return value (.text(),
+   * // .json(), .bytes(), etc.), errorContext surfaces it in the thrown
+   * // error if the command fails — without it the captured bytes vanish
+   * // along with the result you never got.
+   * const output = await $`./build.sh`.errorContext().text();
+   * const output = await $`./build.sh`.errorContext({ maxBytes: 16 * 1024 }).text();
+   * ```
+   */
+  errorContext(value?: boolean): CommandBuilder;
+  /** Enables errorContext capture with the provided options. */
+  errorContext(options: ErrorContextOptions): CommandBuilder;
+  errorContext(valueOrOptions: boolean | ErrorContextOptions = true): CommandBuilder {
+    return this.#newWithState((state) => {
+      if (valueOrOptions === false) {
+        state.errorContext = false;
+      } else if (valueOrOptions === true) {
+        state.errorContext = {};
+      } else {
+        state.errorContext = { ...valueOrOptions };
       }
     });
   }
@@ -1150,29 +1198,59 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     });
   }
   // resolve tail config up front so the InheritTailWriter is constructed in
-  // its final state — applying header/errorContext/promote AFTER the writer
+  // its final state — applying header/errorHeader/promote AFTER the writer
   // has registered with the renderer can leave a one-tick window where the
   // pinned region paints without a header.
   const resolvedTailWriterOptions = state.tailDisplay !== false
     ? resolveTailWriterOptions(state.tailDisplay, state.command.text, Boolean(state.printCommand))
     : undefined;
   const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
-  // when tailDisplay is on for an `"inherit"` stream we need Node's spawn
-  // to pipe the child's output through us instead of connecting the child
-  // directly to the parent's fd (which would bypass the InheritTailWriter
-  // entirely). report the kind as `"inheritPiped"` at the shell level so
-  // the executable handler reads from the pipe and forwards bytes through
-  // our writer chain. user-facing `state.stdout.kind` stays `"inherit"`.
+  // ring buffers retaining the trailing N bytes of each captured stream so
+  // they can be appended to the thrown error message. allocated up front
+  // (before the writer chain is built) so the tap can be inserted between
+  // ShellPipeWriter and whatever the inner sink is — this is what makes
+  // the capture work even when the user piped output to a child command,
+  // a file, or a WritableStream where they otherwise wouldn't see it.
+  // skipped for terminal-bound streams ("inherit" / "inheritPiped") since
+  // the user already watched those bytes scroll by — surfacing them again
+  // in the error would just be noise.
+  const errorContext = state.errorContext;
+  const errorContextMaxBytes = errorContext === false ? 0 : errorContext.maxBytes ?? DEFAULT_ERROR_CONTEXT_BYTES;
+  const stdoutErrorRing = shouldCaptureForErrorContext(errorContext, "stdout", state.stdout.kind)
+    ? new ByteRingBuffer(errorContextMaxBytes)
+    : undefined;
+  const stderrErrorRing = shouldCaptureForErrorContext(errorContext, "stderr", state.stderr.kind)
+    ? new ByteRingBuffer(errorContextMaxBytes)
+    : undefined;
+  // when tailDisplay or errorContext needs to tap a stream that would
+  // otherwise bypass our writer chain (an "inherit" stream connects the
+  // child directly to the parent's fd; a "null" stream wires the child to
+  // /dev/null at the OS level), force the shell-level kind to a piped
+  // variant so the executable handler reads bytes back through our chain
+  // and our wrapped writer (which forwards to stdoutStream / NullPipeWriter
+  // as appropriate) gets a chance to see them. user-facing
+  // `state.stdout.kind` stays unchanged so callers observing the builder
+  // see what they configured.
   const tailEnabled = state.tailDisplay !== false;
-  const stdoutShellKind = tailEnabled && state.stdout.kind === "inherit" ? "inheritPiped" as const : state.stdout.kind;
-  const stderrShellKind = tailEnabled && state.stderr.kind === "inherit" ? "inheritPiped" as const : state.stderr.kind;
+  const stdoutShellKind = resolveShellKind(state.stdout.kind, tailEnabled, stdoutErrorRing != null);
+  const stderrShellKind = resolveShellKind(state.stderr.kind, tailEnabled, stderrErrorRing != null);
+  const stdoutInner = stdoutBuffer === "null"
+    ? new NullPipeWriter()
+    : stdoutBuffer === "inherit"
+    ? stdoutStream
+    : stdoutBuffer;
+  const stderrInner = stderrBuffer === "null"
+    ? new NullPipeWriter()
+    : stderrBuffer === "inherit"
+    ? stderrStream
+    : stderrBuffer;
   const stdout = new ShellPipeWriter(
     stdoutShellKind,
-    stdoutBuffer === "null" ? new NullPipeWriter() : stdoutBuffer === "inherit" ? stdoutStream : stdoutBuffer,
+    stdoutErrorRing != null ? wrapWithErrorContextCapture(stdoutInner, stdoutErrorRing) : stdoutInner,
   );
   const stderr = new ShellPipeWriter(
     stderrShellKind,
-    stderrBuffer === "null" ? new NullPipeWriter() : stderrBuffer === "inherit" ? stderrStream : stderrBuffer,
+    stderrErrorRing != null ? wrapWithErrorContextCapture(stderrInner, stderrErrorRing) : stderrInner,
   );
   const { text: commandText, fds } = state.command;
   const signal = killSignalController.signal;
@@ -1206,13 +1284,15 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
               stdin.cancel();
             }
           }
+          let message: string;
           if (timedOut) {
-            throw new Error(`Timed out with exit code: ${code}`);
+            message = `Timed out with exit code: ${code}`;
           } else if (signal.aborted) {
-            throw new Error(`${timedOut ? "Timed out" : "Aborted"} with exit code: ${code}`);
+            message = `${timedOut ? "Timed out" : "Aborted"} with exit code: ${code}`;
           } else {
-            throw new Error(`Exited with code: ${code}`);
+            message = `Exited with code: ${code}`;
           }
+          throw new Error(message + formatErrorContextSuffix(stdoutErrorRing, stderrErrorRing));
         }
       }
       for (const tw of tailWriters) tw.finalize();
@@ -1580,6 +1660,86 @@ export class CommandResult {
   }
 }
 
+/** Decide whether errorContext should capture the trailing bytes of a
+ * given stream. Skipped when the user disabled it for this stream and
+ * when the stream is going to the user's terminal — for "inherit" /
+ * "inheritPiped" they already saw the bytes, so duplicating them in the
+ * error message would just be noise. */
+function shouldCaptureForErrorContext(
+  errorContext: false | ErrorContextOptions,
+  stream: "stdout" | "stderr",
+  kind: ShellPipeWriterKind,
+): boolean {
+  if (errorContext === false) return false;
+  if (errorContext[stream] === false) return false;
+  if (kind === "inherit" || kind === "inheritPiped") return false;
+  return true;
+}
+
+/** Resolve the shell-level pipe kind given the user-facing kind and whether
+ * any tap (tailDisplay / errorContext) needs the bytes to flow through our
+ * writer chain. "inherit" and "null" both bypass our chain at the OS level,
+ * so they need to be promoted to a piped variant when something will tap
+ * them. tailDisplay can only tap "inherit" (canTail rejects "null"), so
+ * "null" is only promoted when errorContext is capturing this stream —
+ * otherwise the OS-level discard stays the fast path. */
+function resolveShellKind(
+  userKind: ShellPipeWriterKind,
+  tailEnabled: boolean,
+  errorContextEnabled: boolean,
+): ShellPipeWriterKind {
+  if (!tailEnabled && !errorContextEnabled) return userKind;
+  if (userKind === "inherit") return "inheritPiped";
+  if (userKind === "null" && errorContextEnabled) return "piped";
+  return userKind;
+}
+
+/** Wrap a writer with the right sync/async error-context tap based on
+ * whether the inner exposes async `write` or sync `writeSync` — mirrors
+ * the same dispatch `ShellPipeWriter.write` uses, so the wrapper appears
+ * to be the same kind of writer as its inner. */
+function wrapWithErrorContextCapture(
+  inner: Writer | WriterSync,
+  ring: ByteRingBuffer,
+): Writer | WriterSync {
+  if ("write" in inner) {
+    return new ErrorContextCaptureWriter(inner, ring);
+  }
+  return new ErrorContextCaptureWriterSync(inner, ring);
+}
+
+/** Decode a captured ring buffer back to text and produce the suffix
+ * appended to the thrown `Error.message`. Returns `""` when both rings
+ * are empty (or absent), so the error message stays unchanged in cases
+ * where the failed command never wrote anything. */
+function formatErrorContextSuffix(
+  stdoutRing: ByteRingBuffer | undefined,
+  stderrRing: ByteRingBuffer | undefined,
+): string {
+  const stdoutText = stdoutRing != null && stdoutRing.size > 0 ? textDecoder.decode(stdoutRing.toBytes()) : "";
+  const stderrText = stderrRing != null && stderrRing.size > 0 ? textDecoder.decode(stderrRing.toBytes()) : "";
+  if (stdoutText.length === 0 && stderrText.length === 0) return "";
+  // when only one stream has content, surface it without a label so the
+  // common case (just stderr) reads naturally. when both have content,
+  // prefix each so the reader can tell which is which.
+  let suffix = "";
+  if (stderrText.length > 0 && stdoutText.length > 0) {
+    suffix += `\n\nstderr:\n${stripTrailingNewline(stderrText)}`;
+    suffix += `\n\nstdout:\n${stripTrailingNewline(stdoutText)}`;
+  } else if (stderrText.length > 0) {
+    suffix += `\n\n${stripTrailingNewline(stderrText)}`;
+  } else {
+    suffix += `\n\n${stripTrailingNewline(stdoutText)}`;
+  }
+  return suffix;
+}
+
+function stripTrailingNewline(text: string): string {
+  if (text.endsWith("\r\n")) return text.slice(0, -2);
+  if (text.endsWith("\n")) return text.slice(0, -1);
+  return text;
+}
+
 /** Translate the user-facing `TailDisplayOptions` plus the surrounding
  * command context into the constructor-ready shape `InheritTailWriter`
  * expects. The user's `header` callback (if any) is pre-bound with the
@@ -1608,7 +1768,7 @@ function resolveTailWriterOptions(
     maxLines: display.maxLines,
     header,
     headerVerbatim,
-    errorContext: command,
+    errorHeader: command,
     promoteHeaderOnSuccess,
   };
 }
