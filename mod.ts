@@ -43,7 +43,7 @@ export {
   type UnsetVarChange,
 } from "./src/result.ts";
 export { type ShellOptionsState, WhichEnv, whichRealEnv } from "./src/shell.ts";
-export { createExecutableCommand } from "./src/commands/executable.ts";
+export { createExecutableCommand, type CreateExecutableCommandOptions } from "./src/commands/executable.ts";
 export { type Stderr, stderr, type Stdin, stdin, type Stdout, stdout } from "./src/streams.ts";
 export { $, type $Base, type $Type, build$, type Create$Options } from "./src/dollar.ts";
 

@@ -869,6 +869,24 @@ Deno.test("env should be clean slate when clearEnv is set", async () => {
   }
 });
 
+Deno.test("createExecutableCommand prepends args from options", async () => {
+  const denoPath = await which("deno", whichRealEnv);
+  if (denoPath == null) throw new Error("deno binary not found on PATH");
+  const text = await $`deno-eval 'console.log("hi: " + Deno.args.join(","))' a b`
+    .registerCommand("deno-eval", createExecutableCommand(denoPath, { args: ["eval", "--no-config"] }))
+    .text();
+  assertEquals(text, "hi: a,b");
+});
+
+Deno.test("createExecutableCommand without options behaves as before", async () => {
+  const denoPath = await which("deno", whichRealEnv);
+  if (denoPath == null) throw new Error("deno binary not found on PATH");
+  const text = await $`my-deno eval --no-config 'console.log("ok")'`
+    .registerCommand("my-deno", createExecutableCommand(denoPath))
+    .text();
+  assertEquals(text, "ok");
+});
+
 Deno.test("clearEnv + exportEnv should not clear out real environment", async () => {
   const denoPath = await which("deno", whichRealEnv);
   if (denoPath == null) throw new Error("deno binary not found on PATH");
