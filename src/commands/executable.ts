@@ -13,12 +13,23 @@ import { spawnCommand, type SpawnedChildProcess } from "../spawn.ts";
 
 const neverAbortedSignal = new AbortController().signal;
 
+/** Options for {@link createExecutableCommand}. */
+export interface CreateExecutableCommandOptions {
+  /** Arguments to prepend to the arguments provided when invoking the command. */
+  args?: string[];
+}
+
 /**
  * Creates a new command that runs the executable at the specified path.
  * @param resolvedPath A fully resolved path.
+ * @param options Additional options for the command.
  * @returns Command handler that can be registered in a `CommandBuilder`.
  */
-export function createExecutableCommand(resolvedPath: string): CommandHandler {
+export function createExecutableCommand(
+  resolvedPath: string,
+  options?: CreateExecutableCommandOptions,
+): CommandHandler {
+  const prependArgs = options?.args;
   return async function executeCommandAtPath(
     context: CommandContext,
   ): Promise<ExecuteResult> {
@@ -29,9 +40,10 @@ export function createExecutableCommand(resolvedPath: string): CommandHandler {
     };
     let p: SpawnedChildProcess;
     const cwd = context.cwd;
+    const args = prependArgs != null && prependArgs.length > 0 ? [...prependArgs, ...context.args] : context.args;
     try {
       p = spawnCommand(resolvedPath, {
-        args: context.args,
+        args,
         cwd,
         env: context.env,
         ...pipeStringVals,
