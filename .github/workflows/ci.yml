@@ -42,7 +42,7 @@ jobs:
 
       - name: check
         if: runner.os == 'Linux'
-        run: deno check
+        run: deno check --all
 
       - name: deno test
         run: deno test -P
