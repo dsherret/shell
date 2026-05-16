@@ -1190,6 +1190,8 @@ export async function whichFromContext(commandName: string, context: {
   return await which(commandName, {
     isWindows,
     stat: whichRealEnv.stat,
+    lstat: whichRealEnv.lstat,
+    readLink: whichRealEnv.readLink,
     env(key) {
       return context.getVar(key);
     },
