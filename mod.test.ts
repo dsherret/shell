@@ -637,6 +637,24 @@ Deno.test("should support custom command handlers", async () => {
   }
 });
 
+Deno.test("null command", async () => {
+  {
+    const result = await $`:`.noThrow().stdout("piped");
+    assertEquals(result.code, 0);
+    assertEquals(result.stdout, "");
+  }
+  {
+    const result = await $`: ignored args && echo ok`.noThrow().stdout("piped");
+    assertEquals(result.code, 0);
+    assertEquals(result.stdout, "ok\n");
+  }
+  {
+    const result = await $`: && echo yes || echo no`.noThrow().stdout("piped");
+    assertEquals(result.code, 0);
+    assertEquals(result.stdout, "yes\n");
+  }
+});
+
 Deno.test("should not allow invalid command names", () => {
   const builder = new CommandBuilder();
   const hax: CommandHandler = (context: CommandContext) => {
