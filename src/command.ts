@@ -172,6 +172,8 @@ const builtInCommands: Record<string, CommandHandler> = {
   touch: touchCommand,
   true: () => ({ code: 0 }),
   false: () => ({ code: 1 }),
+  // POSIX null command: discards its arguments and always exits 0
+  ":": () => ({ code: 0 }),
   unset: unsetCommand,
   which: whichCommand,
 };
