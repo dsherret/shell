@@ -4,7 +4,9 @@
   "test": {
     "permissions": {
       "all": true
-    }
+    },
+    "sanitizeOps": true,
+    "sanitizeResources": true
   },
   "tasks": {
     "test": "deno test -P && deno task test:node",
