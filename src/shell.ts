@@ -10,7 +10,6 @@ import * as wasmInstance from "./lib/rs_lib.js";
 import {
   NullPipeReader,
   NullPipeWriter,
-  pipeReadableToWriterSync,
   PipeSequencePipe,
   type PipeWriter,
   type Reader,
@@ -1091,7 +1090,7 @@ function pipeCommandPipeReaderToWriterSync(
 ) {
   switch (reader) {
     case "inherit":
-      return pipeReadableToWriterSync(stdinStream.readable, writer, signal);
+      return pipeReaderToWriterSync(stdinStream, writer, signal);
     case "null":
       return Promise.resolve();
     default: {
