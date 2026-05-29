@@ -1,4 +1,3 @@
-import { Readable } from "node:stream";
 import { writeSyncAll } from "./fsFile.ts";
 
 /** Process-level stdin abstraction. */
@@ -8,8 +7,9 @@ export interface Stdin {
    * read completes, the returned promise rejects with `signal.reason` and
    * any bytes that arrive afterwards stay buffered for the next `read`. */
   read(p: Uint8Array, options?: { signal?: AbortSignal }): Promise<number | null>;
-  /** A `ReadableStream` view of stdin. Cached so repeated access shares
-   * the same stream rather than competing for the underlying fd. */
+  /** A `ReadableStream` view of stdin, backed by {@link read} so it shares
+   * the same fd without locking it. Cached so repeated access shares the
+   * same stream until it is cancelled. */
   readonly readable: ReadableStream<Uint8Array>;
   /** Toggles raw mode on stdin when it is attached to a TTY. */
   setRaw(mode: boolean): void;
@@ -29,38 +29,42 @@ export interface Stdout {
 export type Stderr = Stdout;
 
 let cachedStdinReadable: ReadableStream<Uint8Array> | undefined;
-let cachedStdinReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-let pendingStdinRead: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
-let stdinLeftover: Uint8Array | undefined;
 
 function getStdinReadable(): ReadableStream<Uint8Array> {
-  // wrapping process.stdin locks it to one consumer; cache so repeated
-  // access shares the same stream rather than fighting over the same fd.
-  return cachedStdinReadable ??= Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
+  if (cachedStdinReadable !== undefined) return cachedStdinReadable;
+  // Build the stream on top of `read` rather than `Readable.toWeb`, which
+  // would permanently lock the fd to a web-stream adapter. Each pull reads in
+  // paused mode and detaches, so accessing `.readable` then reading stdin
+  // directly later still works. Cached so repeated access shares one stream.
+  const abortController = new AbortController();
+  return cachedStdinReadable = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const buf = new Uint8Array(16 * 1024);
+      let bytesRead: number | null;
+      try {
+        bytesRead = await readStdin(buf, abortController.signal);
+      } catch (err) {
+        if (abortController.signal.aborted) return; // cancelled
+        throw err;
+      }
+      if (bytesRead === null) controller.close();
+      else controller.enqueue(buf.subarray(0, bytesRead));
+    },
+    cancel() {
+      abortController.abort();
+      cachedStdinReadable = undefined;
+    },
+  });
 }
 
 /** Default {@link Stdin} bound to the host process's stdin fd. */
 export const stdin: Stdin = {
-  async read(p: Uint8Array, options?: { signal?: AbortSignal }): Promise<number | null> {
+  read(p: Uint8Array, options?: { signal?: AbortSignal }): Promise<number | null> {
     const signal = options?.signal;
     signal?.throwIfAborted();
-
-    if (stdinLeftover === undefined) {
-      cachedStdinReader ??= getStdinReadable().getReader();
-      // share a single in-flight read across callers so an aborted read
-      // doesn't drop bytes — the next call awaits the same promise.
-      pendingStdinRead ??= cachedStdinReader.read();
-      const result = await (signal ? raceAbort(pendingStdinRead, signal) : pendingStdinRead);
-      pendingStdinRead = undefined;
-      if (result.done) return null;
-      stdinLeftover = result.value;
-    }
-
-    const len = Math.min(stdinLeftover.length, p.length);
-    p.set(stdinLeftover.subarray(0, len));
-    stdinLeftover = stdinLeftover.length > len ? stdinLeftover.subarray(len) : undefined;
-    return len;
+    return readStdin(p, signal);
   },
+  // todo: remove this as it's unused
   get readable(): ReadableStream<Uint8Array> {
     return getStdinReadable();
   },
@@ -84,20 +88,53 @@ export const stdout: Stdout = {
   },
 };
 
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (v) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(v);
-      },
-      (e) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(e);
-      },
-    );
+// reads directly from the `process.stdin` Node stream in paused mode rather
+// than `Readable.toWeb`, which permanently locks the fd to a web-stream
+// adapter and never releases it. Listening for a single `readable` event and
+// detaching afterwards leaves stdin in a clean, handoff-able state — so a
+// later reader (including one outside dax) still works — while remaining
+// abortable: aborting just removes the listener, with no read syscall left
+// outstanding to steal a byte.
+function readStdin(p: Uint8Array, signal?: AbortSignal): Promise<number | null> {
+  const stream = process.stdin;
+  return new Promise<number | null>((resolve, reject) => {
+    const onReadable = () => {
+      const chunk = stream.read() as Uint8Array | null;
+      if (chunk === null) return; // nothing buffered yet; wait for the next event
+      cleanup();
+      const len = Math.min(chunk.length, p.length);
+      p.set(chunk.subarray(0, len));
+      // put any bytes we didn't consume back into the stream rather than a
+      // private buffer, so the next reader — including one outside dax —
+      // still sees them.
+      if (chunk.length > len) stream.unshift(chunk.subarray(len));
+      resolve(len);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(null);
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(signal!.reason);
+    };
+    const cleanup = () => {
+      stream.off("readable", onReadable);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    stream.on("readable", onReadable);
+    stream.on("end", onEnd);
+    stream.on("error", onError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    // data may already be buffered, so attempt a read right away.
+    onReadable();
   });
 }
 
