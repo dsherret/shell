@@ -1386,6 +1386,22 @@ Deno.test("command .lines()", async () => {
   assertEquals(result, ["1", "2"]);
 });
 
+Deno.test("command .lines() with no output", async () => {
+  const result = await $`true`.lines();
+  assertEquals(result, []);
+});
+
+Deno.test("command .lines() matches .linesIter()", async () => {
+  for (const text of ["", "1\n2\n", "1\n2", "1\n\n2\n", "\n"]) {
+    const cmd = $`deno eval ${"await Deno.stdout.write(new TextEncoder().encode(" + JSON.stringify(text) + "))"}`;
+    const iter: string[] = [];
+    for await (const line of cmd.linesIter()) {
+      iter.push(line);
+    }
+    assertEquals(await cmd.lines(), iter, `mismatch for ${JSON.stringify(text)}`);
+  }
+});
+
 Deno.test("command .lines('stderr')", async () => {
   const result = await $`deno eval "console.error(1); console.error(2)"`.env("NO_COLOR", "1").lines("stderr");
   assertEquals(result, ["1", "2"]);
