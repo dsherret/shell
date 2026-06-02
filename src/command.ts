@@ -986,8 +986,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * ```
    */
   async text(kind: StreamKind = "stdout"): Promise<string> {
-    const command = kind === "combined" ? this.quiet(kind).captureCombined() : this.quiet(kind);
-    return (await command)[kind].replace(/\r?\n$/, "");
+    return (await this.#textRaw(kind)).replace(/\r?\n$/, "");
   }
 
   /**
@@ -999,8 +998,13 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * line ending is excluded, and empty output yields no lines.
    */
   async lines(kind: StreamKind = "stdout"): Promise<string[]> {
+    return splitLines(await this.#textRaw(kind));
+  }
+
+  /** Runs the command quietly and gets the raw captured text for the stream, including any trailing newline. */
+  async #textRaw(kind: StreamKind): Promise<string> {
     const command = kind === "combined" ? this.quiet(kind).captureCombined() : this.quiet(kind);
-    return splitLines((await command)[kind]);
+    return (await command)[kind];
   }
 
   /**
