@@ -986,14 +986,24 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
    * ```
    */
   async text(kind: StreamKind = "stdout"): Promise<string> {
-    const command = kind === "combined" ? this.quiet(kind).captureCombined() : this.quiet(kind);
-    return (await command)[kind].replace(/\r?\n$/, "");
+    return (await this.#textRaw(kind)).replace(/\r?\n$/, "");
   }
 
-  /** Gets the text as an array of lines. */
+  /**
+   * Gets the text as an array of lines.
+   *
+   * Lines are split the same way as {@link CommandBuilder.linesIter} (matches
+   * [Rust's `str::lines`](https://doc.rust-lang.org/std/primitive.str.html#method.lines)):
+   * line terminators are not included, a trailing blank line caused by a final
+   * line ending is excluded, and empty output yields no lines.
+   */
   async lines(kind: StreamKind = "stdout"): Promise<string[]> {
-    const text = await this.text(kind);
-    return text.split(/\r?\n/g);
+    return splitLines(await this.#textRaw(kind));
+  }
+
+  async #textRaw(kind: StreamKind): Promise<string> {
+    const command = kind === "combined" ? this.quiet(kind).captureCombined() : this.quiet(kind);
+    return (await command)[kind];
   }
 
   /**
@@ -2412,6 +2422,22 @@ function attachCallerStack(err: unknown, callerStack: string | undefined): void 
   const frames = callerStack.slice(newlineIdx + 1);
   if (frames.length === 0) return;
   err.stack = err.stack == null ? frames : `${err.stack}\n${frames}`;
+}
+
+function splitLines(text: string): string[] {
+  const lines: string[] = [];
+  let start = 0;
+  while (true) {
+    const nl = text.indexOf("\n", start);
+    if (nl === -1) break;
+    // strip \r when it immediately precedes \n
+    const end = nl > start && text.charCodeAt(nl - 1) === 13 ? nl - 1 : nl;
+    lines.push(text.substring(start, end));
+    start = nl + 1;
+  }
+  // a final line ending does not produce a trailing blank line
+  if (start < text.length) lines.push(text.substring(start));
+  return lines;
 }
 
 async function* iterateLines(
