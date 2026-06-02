@@ -1391,8 +1391,13 @@ Deno.test("command .lines() with no output", async () => {
   assertEquals(result, []);
 });
 
+Deno.test("command .lines() strips \\r\\n", async () => {
+  const result = await $`deno eval ${'await Deno.stdout.write(new TextEncoder().encode("1\\r\\n2\\r\\n"))'}`.lines();
+  assertEquals(result, ["1", "2"]);
+});
+
 Deno.test("command .lines() matches .linesIter()", async () => {
-  for (const text of ["", "1\n2\n", "1\n2", "1\n\n2\n", "\n"]) {
+  for (const text of ["", "1\n2\n", "1\n2", "1\n\n2\n", "\n", "1\r\n2\r\n", "1\r\n2", "\r\n"]) {
     const cmd = $`deno eval ${"await Deno.stdout.write(new TextEncoder().encode(" + JSON.stringify(text) + "))"}`;
     const iter: string[] = [];
     for await (const line of cmd.linesIter()) {
