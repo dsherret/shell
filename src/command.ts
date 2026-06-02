@@ -1001,7 +1001,6 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     return splitLines(await this.#textRaw(kind));
   }
 
-  /** Runs the command quietly and gets the raw captured text for the stream, including any trailing newline. */
   async #textRaw(kind: StreamKind): Promise<string> {
     const command = kind === "combined" ? this.quiet(kind).captureCombined() : this.quiet(kind);
     return (await command)[kind];
