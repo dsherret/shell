@@ -219,6 +219,55 @@ lo"`.stdout("piped");
   assertEquals(output.stdout, "hello\n");
 });
 
+// mirrors the `command_substitution` test in deno_task_shell
+Deno.test("command substitution", async () => {
+  assertEquals((await $`echo $(echo 1)`.stdout("piped")).stdout, "1\n");
+  assertEquals((await $`echo $(echo 1 && echo 2)`.stdout("piped")).stdout, "1 2\n");
+  assertEquals((await $`echo "hi $(echo 1)"`.stdout("piped")).stdout, "hi 1\n");
+  // nested
+  assertEquals((await $`echo $(echo $(echo 1))`.stdout("piped")).stdout, "1\n");
+  // deno_task_shell additionally tests `&` async commands inside the
+  // substitution (e.g. `$(sleep 0.1 && echo 1 & echo echo) 2`). This fork
+  // intentionally does not support backgrounding, so those forms reject.
+  await assertRejects(() => $`$(echo 1 & echo echo) 2`.text(), Error, "Async commands are not supported");
+});
+
+// mirrors the `backticks` test in deno_task_shell
+Deno.test("backticks", async () => {
+  assertEquals((await $`echo \`\``.stdout("piped")).stdout, "\n");
+  assertEquals((await $`echo \`echo 1\``.stdout("piped")).stdout, "1\n");
+  assertEquals((await $`echo \`echo 1 && echo 2\``.stdout("piped")).stdout, "1 2\n");
+  assertEquals((await $`echo "hi \`echo 1\`"`.stdout("piped")).stdout, "hi 1\n");
+  // nested
+  assertEquals((await $`echo \`echo \\\`echo 1\\\`\``.stdout("piped")).stdout, "1\n");
+  // see note in "command substitution" about async being unsupported in this fork
+  await assertRejects(() => $`\`echo 1 & echo echo\` 2`.text(), Error, "Async commands are not supported");
+});
+
+// additional dax-specific coverage beyond deno_task_shell's two test functions
+Deno.test("command substitution: output whitespace is collapsed and the word is concatenated", async () => {
+  // matches deno_task_shell's `echo test$(echo "1    2")` => `test1 2`
+  assertEquals((await $`echo test$(echo "1    2")`.stdout("piped")).stdout, "test1 2\n");
+});
+
+Deno.test("command substitution: can be assigned to a shell var", async () => {
+  assertEquals(await $`A=$(echo hello) && echo $A`.text(), "hello");
+});
+
+Deno.test("command substitution: the whole command can come from a substitution", async () => {
+  // mirrors deno_task_shell's `$(cat file)` case
+  await withTempDir(async (dir) => {
+    dir.join("file").writeTextSync("echo hello");
+    assertEquals((await $`$(cat file)`.cwd(dir.toString()).stdout("piped")).stdout, "hello\n");
+  });
+});
+
+Deno.test("command substitution: env changes inside it do not leak to the parent", async () => {
+  // the inner export runs in a subshell, so the parent's FOO is unaffected
+  const result = await $`export FOO=outer && echo $(export FOO=inner && echo $FOO):$FOO`.text();
+  assertEquals(result, "inner:outer");
+});
+
 Deno.test("should not get stdout when set to writer", async () => {
   const buffer = new Buffer();
   const output = await $`echo 5`.stdout(buffer);

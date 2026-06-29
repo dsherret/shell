@@ -15,6 +15,7 @@ import {
   type Reader,
   ShellPipeWriter,
 } from "./pipes.ts";
+import { Buffer } from "@std/io/buffer";
 import { type EnvChange, type ExecuteResult, getAbortedResult, type ShellOption } from "./result.ts";
 import { stdin as stdinStream } from "./streams.ts";
 
@@ -1474,7 +1475,8 @@ async function evaluateWordParts(wordParts: WordPart[], context: Context, quoted
         break;
       }
       case "command":
-        throw new Error(`Not implemented: ${stringPart.kind}`);
+        evaluationResult = await evaluateCommandSubstitution(stringPart.value, context);
+        break;
     }
 
     if (evaluationResult != null) {
@@ -1513,6 +1515,16 @@ async function evaluateWordParts(wordParts: WordPart[], context: Context, quoted
     result.push(...await evaluateWordText(currentText, quoted));
   }
   return result;
+}
+
+async function evaluateCommandSubstitution(list: SequentialList, context: Context): Promise<string> {
+  const buffer = new Buffer();
+  const subContext = context.withInner({
+    stdout: new ShellPipeWriter("piped", buffer),
+  });
+  await executeSequentialList(list, subContext);
+  const text = new TextDecoder().decode(buffer.bytes({ copy: false }));
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function isDisposable(value: unknown): value is Disposable {
