@@ -28,19 +28,44 @@ export function spawnCommand(path: string, options: SpawnCommandOptions): Spawne
   // launching bat or cmd files in Node.js will error, so launch
   // via cmd.exe instead https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2
   const isWindowsBatch = isWindows && /\.(cmd|bat)$/i.test(path);
-  const child = cp.spawn(
-    isWindowsBatch ? "cmd.exe" : path,
-    isWindowsBatch ? ["/d", "/s", "/c", path, ...options.args] : options.args,
-    {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: [
-        toNodeStdio(options.stdin),
-        toNodeStdio(options.stdout),
-        toNodeStdio(options.stderr),
-      ],
-    },
-  );
+  const child = isWindowsBatch
+    ? cp.spawn(
+      "cmd.exe",
+      // cmd.exe's own argument parsing does not follow the usual
+      // CommandLineToArgvW convention that Node's default (non-verbatim)
+      // escaping assumes, so passing `path`/`args` as separate argv
+      // elements (relying on Node to quote them) corrupts any element
+      // containing a space - e.g. the default Node.js install path,
+      // "C:\Program Files\nodejs\npx.cmd". Node's own `{ shell: true }`
+      // handling for cmd.exe works around this the same way: join into a
+      // single command string, quote each piece, wrap the whole thing in
+      // one more pair of quotes, and mark it `windowsVerbatimArguments` so
+      // Node passes that string through untouched.
+      ["/d", "/s", "/c", `"${[path, ...options.args].map(escapeCmdArg).join(" ")}"`],
+      {
+        cwd: options.cwd,
+        env: options.env,
+        windowsVerbatimArguments: true,
+        stdio: [
+          toNodeStdio(options.stdin),
+          toNodeStdio(options.stdout),
+          toNodeStdio(options.stderr),
+        ],
+      },
+    )
+    : cp.spawn(
+      path,
+      options.args,
+      {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: [
+          toNodeStdio(options.stdin),
+          toNodeStdio(options.stdout),
+          toNodeStdio(options.stderr),
+        ],
+      },
+    );
   const exitResolvers = Promise.withResolvers<number>();
   child.on("exit", (code) => {
     if (code == null && receivedSignal != null) {
@@ -81,4 +106,21 @@ function toNodeStdio(stdio: "inherit" | "null" | "piped") {
     case "piped":
       return "pipe";
   }
+}
+
+/**
+ * Quotes a single argument for inclusion in a `cmd.exe /c "..."` command
+ * line, following the `CommandLineToArgvW` convention that Windows programs
+ * (including `cmd.exe`'s own re-parsing of its `/c` argument once the outer
+ * quotes are stripped) expect: wrap in `"`, double any embedded `"`, and
+ * escape a run of `\` only when it immediately precedes a `"` (an unescaped
+ * trailing `\` right before the closing quote would otherwise escape that
+ * quote instead of terminating the argument).
+ */
+export function escapeCmdArg(arg: string): string {
+  if (arg.length > 0 && !/[\s"]/.test(arg)) {
+    return arg;
+  }
+  const escaped = arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1");
+  return `"${escaped}"`;
 }
