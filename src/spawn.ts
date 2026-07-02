@@ -30,10 +30,16 @@ export function spawnCommand(path: string, options: SpawnCommandOptions): Spawne
   const isWindowsBatch = isWindows && /\.(cmd|bat)$/i.test(path);
   const child = cp.spawn(
     isWindowsBatch ? "cmd.exe" : path,
-    isWindowsBatch ? ["/d", "/s", "/c", path, ...options.args] : options.args,
+    isWindowsBatch ? getWindowsBatchArgs(path, options.args) : options.args,
     {
       cwd: options.cwd,
       env: options.env,
+      // cmd.exe parses its command line differently than the
+      // `CommandLineToArgvW` convention that Node's default escaping assumes, so
+      // escape the arguments ourselves (see `getWindowsBatchArgs`) and tell Node
+      // to pass them through verbatim. Without this, a `.cmd`/`.bat` path or
+      // argument containing a space is split by cmd.exe.
+      windowsVerbatimArguments: isWindowsBatch,
       stdio: [
         toNodeStdio(options.stdin),
         toNodeStdio(options.stdout),
@@ -70,6 +76,49 @@ export function spawnCommand(path: string, options: SpawnCommandOptions): Spawne
       return Readable.toWeb(child.stderr!) as ReadableStream;
     },
   };
+}
+
+// Builds the `cmd.exe` arguments for launching a Windows batch (.cmd/.bat)
+// file, escaping the file path and arguments for cmd.exe's parser. This mirrors
+// the approach used by https://github.com/moxystudio/node-cross-spawn to work
+// around https://github.com/nodejs/node/issues/7367 — most notably a path or
+// argument that contains a space.
+function getWindowsBatchArgs(path: string, args: string[]): string[] {
+  // a cmd-shim (ex. `node_modules/.bin/*.cmd`) proxies through Node.js, which
+  // re-interprets the arguments, so its meta characters need escaping twice
+  const doubleEscapeMetaChars = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/i.test(path);
+  const command = [
+    escapeCmdCommand(path),
+    ...args.map((arg) => escapeCmdArgument(arg, doubleEscapeMetaChars)),
+  ].join(" ");
+  // `/s` forces cmd.exe to strip the outer quotes around the whole command
+  return ["/d", "/s", "/c", `"${command}"`];
+}
+
+// see http://www.robvanderwoude.com/escapechars.php
+const cmdMetaCharsRegex = /([()\][%!^"`<>&|;, *?])/g;
+
+function escapeCmdCommand(arg: string): string {
+  return arg.replace(cmdMetaCharsRegex, "^$1");
+}
+
+function escapeCmdArgument(arg: string, doubleEscapeMetaChars: boolean): string {
+  // algorithm based on https://qntm.org/cmd
+
+  // a run of backslashes followed by a double quote: double up the backslashes
+  // and escape the quote
+  arg = arg.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
+  // a run of backslashes at the end of the string: double them up because they
+  // will precede the closing quote added below
+  arg = arg.replace(/(?=(\\+?)?)\1$/, "$1$1");
+  // quote the whole argument
+  arg = `"${arg}"`;
+  // escape meta chars
+  arg = arg.replace(cmdMetaCharsRegex, "^$1");
+  if (doubleEscapeMetaChars) {
+    arg = arg.replace(cmdMetaCharsRegex, "^$1");
+  }
+  return arg;
 }
 
 function toNodeStdio(stdio: "inherit" | "null" | "piped") {
