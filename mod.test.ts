@@ -2798,6 +2798,19 @@ Deno.test("windows cmd file resolved from a relative forward-slash PATH entry", 
   });
 });
 
+Deno.test("windows cmd file with a space in its path", { ignore: process.platform !== "win32" }, async () => {
+  await withTempDir(async (tempDir) => {
+    // reproduces https://github.com/dsherret/dax/issues/403 — cmd.exe would
+    // otherwise split the path at the space (ex. `C:\Program Files\...`)
+    const dir = tempDir.join("with space");
+    dir.mkdirSync();
+    dir.join("script.cmd").writeSync("@echo off\ndeno %*\n");
+    const path = dir.join("script.cmd").toString();
+    const result = await $`${path} eval "console.log(1); console.log(2)"`.lines("combined");
+    assertEquals(result, ["1", "2"]);
+  });
+});
+
 Deno.test("negation chaining", async () => {
   await assertEquals(await $`! false && echo 1`.text(), "1");
   await assertRejects(
