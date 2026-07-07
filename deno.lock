@@ -4,7 +4,7 @@
     "jsr:@david/console-static-text@~0.3.4": "0.3.4",
     "jsr:@david/path@0.3": "0.3.2",
     "jsr:@david/temp@~0.2.1": "0.2.1",
-    "jsr:@david/which@0.7": "0.7.0",
+    "jsr:@david/which@~0.7.1": "0.7.1",
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/bytes@^1.0.6": "1.0.6",
     "jsr:@std/fmt@1": "1.0.10",
@@ -25,8 +25,8 @@
         "jsr:@david/path"
       ]
     },
-    "@david/which@0.7.0": {
-      "integrity": "2e7517b28ecd2c99afe70284f2660f2c11548e5b684fa751889f105e0e4f8fe5"
+    "@david/which@0.7.1": {
+      "integrity": "dbc4d2f275650964f7c37a7719f693fac3a836b286d13ec25c2543364cc62d49"
     },
     "@std/assert@1.0.19": {
       "integrity": "eaada96ee120cb980bc47e040f82814d786fe8162ecc53c91d8df60b8755991e",
@@ -61,7 +61,7 @@
       "jsr:@david/console-static-text@~0.3.4",
       "jsr:@david/path@0.3",
       "jsr:@david/temp@~0.2.1",
-      "jsr:@david/which@0.7",
+      "jsr:@david/which@~0.7.1",
       "jsr:@std/assert@1",
       "jsr:@std/fmt@1",
       "jsr:@std/io@0.225",
