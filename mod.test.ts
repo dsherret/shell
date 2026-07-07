@@ -2779,6 +2779,25 @@ Deno.test("windows cmd file with a space in its path", { ignore: process.platfor
   });
 });
 
+Deno.test("windows cmd file resolved from a relative forward-slash PATH entry", {
+  ignore: process.platform !== "win32",
+}, async () => {
+  await withTempDir(async (tempDir) => {
+    // reproduces https://github.com/dsherret/dax/issues/405 — a relative PATH
+    // entry with forward slashes (ex. `./node_modules/.bin`) resolves the
+    // command to a forward-slash path that cmd.exe would parse with `.` as the
+    // command
+    const binDir = tempDir.join("node_modules/.bin");
+    binDir.mkdirSync({ recursive: true });
+    binDir.join("script.cmd").writeSync("@echo off\ndeno %*\n");
+    const result = await $`script eval "console.log(1); console.log(2)"`
+      .cwd(tempDir.toString())
+      .env({ PATH: `./node_modules/.bin;${process.env.PATH}` })
+      .lines("combined");
+    assertEquals(result, ["1", "2"]);
+  });
+});
+
 Deno.test("negation chaining", async () => {
   await assertEquals(await $`! false && echo 1`.text(), "1");
   await assertRejects(

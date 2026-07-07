@@ -57,6 +57,6 @@
     "@std/fmt": "jsr:@std/fmt@1",
     "@std/io": "jsr:@std/io@^0.225",
     "@std/path": "jsr:@std/path@1",
-    "which": "jsr:@david/which@^0.7.0"
+    "which": "jsr:@david/which@^0.7.1"
   }
 }
