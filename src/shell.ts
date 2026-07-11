@@ -67,7 +67,7 @@ export interface SimpleCommand {
 
 export type Word = WordPart[];
 
-export type WordPart = Text | Variable | StringPartCommand | Quoted | Tilde;
+export type WordPart = Text | Variable | StringPartCommand | Quoted | Tilde | Brace;
 export type TextPart = Text | {
   kind: "quoted";
   value: string;
@@ -95,6 +95,11 @@ export interface Quoted {
 
 export interface Tilde {
   kind: "tilde";
+}
+
+export interface Brace {
+  kind: "brace";
+  value: Word[];
 }
 
 export interface Subshell extends SequentialList {
@@ -1315,7 +1320,45 @@ async function evaluateWord(word: Word, context: Context) {
   return result.join(" ");
 }
 
-async function evaluateWordParts(wordParts: WordPart[], context: Context, quoted = false) {
+async function evaluateWordParts(wordParts: WordPart[], context: Context) {
+  // brace alternatives are expanded first into a list of brace-free part
+  // lists (one per cartesian-product combination), then each is evaluated
+  const result: string[] = [];
+  for (const expanded of expandBraces(wordParts)) {
+    result.push(...await evaluateWordPartsInner(expanded, context, false));
+  }
+  return result;
+}
+
+// expands a flat list of word parts containing any number of brace
+// alternatives into a list of brace-free part lists, one per
+// cartesian-product combination of the alternatives (mirrors
+// deno_task_shell's `expand_braces`)
+function expandBraces(parts: WordPart[]): WordPart[][] {
+  let results: WordPart[][] = [[]];
+  for (const part of parts) {
+    if (part.kind === "brace") {
+      const expanded = part.value.flatMap((word) => expandBraces(word));
+      if (expanded.length === 0) {
+        continue;
+      }
+      const next: WordPart[][] = [];
+      for (const prefix of results) {
+        for (const alt of expanded) {
+          next.push([...prefix, ...alt]);
+        }
+      }
+      results = next;
+    } else {
+      for (const r of results) {
+        r.push(part);
+      }
+    }
+  }
+  return results;
+}
+
+async function evaluateWordPartsInner(wordParts: WordPart[], context: Context, quoted: boolean) {
   function hasGlobChar(text: string, questionGlob: boolean) {
     for (let i = 0; i < text.length; i++) {
       switch (text[i]) {
@@ -1458,7 +1501,7 @@ async function evaluateWordParts(wordParts: WordPart[], context: Context, quoted
         evaluationResult = context.getVar(stringPart.value); // value is name
         break;
       case "quoted": {
-        const text = (await evaluateWordParts(stringPart.value, context, true)).join(" ");
+        const text = (await evaluateWordPartsInner(stringPart.value, context, true)).join(" ");
         currentText.push({
           kind: "quoted",
           value: text,
@@ -1477,6 +1520,9 @@ async function evaluateWordParts(wordParts: WordPart[], context: Context, quoted
       case "command":
         evaluationResult = await evaluateCommandSubstitution(stringPart.value, context);
         break;
+      case "brace":
+        // brace parts are expanded by `expandBraces` before we ever reach here
+        throw new Error("brace parts must be expanded before evaluation");
     }
 
     if (evaluationResult != null) {

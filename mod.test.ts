@@ -276,6 +276,35 @@ Deno.test("reserved words in argument position", async () => {
   }
 });
 
+// mirrors the `brace_expansion` test in deno_task_shell
+Deno.test("brace expansion", async () => {
+  // comma form
+  assertEquals(await $`echo {a,b,c}`.text(), "a b c");
+  // prefix and suffix concat
+  assertEquals(await $`echo pre{a,b}post`.text(), "preapost prebpost");
+  // cartesian product across multiple braces
+  assertEquals(await $`echo {a,b}{1,2}`.text(), "a1 a2 b1 b2");
+  // nested
+  assertEquals(await $`echo {a,{b,c}}`.text(), "a b c");
+  // integer range, reverse range, and range with step
+  assertEquals(await $`echo {1..3}`.text(), "1 2 3");
+  assertEquals(await $`echo {3..1}`.text(), "3 2 1");
+  assertEquals(await $`echo {1..7..2}`.text(), "1 3 5 7");
+  // single-char range
+  assertEquals(await $`echo {a..e}`.text(), "a b c d e");
+  // empty alternatives expand to empty strings
+  assertEquals(await $`echo x{a,,b}y`.text(), "xay xy xby");
+
+  // bare {} is literal (find -exec {} idiom), as is a single-element or unmatched brace
+  assertEquals(await $`echo {}`.text(), "{}");
+  assertEquals(await $`echo {abc}`.text(), "{abc}");
+  assertEquals(await $`echo {abc`.text(), "{abc");
+  assertEquals(await $`echo abc}`.text(), "abc}");
+  // inside quotes braces are literal
+  assertEquals(await $`echo "{a,b}"`.text(), "{a,b}");
+  assertEquals(await $`echo '{a,b}'`.text(), "{a,b}");
+});
+
 // additional dax-specific coverage beyond deno_task_shell's two test functions
 Deno.test("command substitution: output whitespace is collapsed and the word is concatenated", async () => {
   // matches deno_task_shell's `echo test$(echo "1    2")` => `test1 2`
