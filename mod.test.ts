@@ -244,6 +244,38 @@ Deno.test("backticks", async () => {
   await assertRejects(() => $`\`echo 1 & echo echo\` 2`.text(), Error, "Async commands are not supported");
 });
 
+// mirrors the `reserved_words_in_argument_position` test in deno_task_shell
+Deno.test("reserved words in argument position", async () => {
+  // a reserved word is only special as the command name, so as an argument it's a plain word
+  const words = "if then elif else fi do done case esac while until for in";
+  assertEquals(await $`echo ${words}`.text(), words);
+  assertEquals(await $`deno eval 'console.log(Deno.args.join(","))' -- for while`.text(), "for,while");
+  assertEquals(await $`FOO=if && echo $FOO`.text(), "if");
+  // reserved words are only recognized as a whole unquoted word and are case sensitive
+  assertEquals(await $`echo iffy --if if.txt "if" IF`.text(), "iffy --if if.txt if IF");
+
+  // ...but as the command name they're still rejected, since compound commands aren't supported
+  await assertReservedWordError(() => $`if foo`);
+  await assertReservedWordError(() => $`echo 1; done`);
+  await assertReservedWordError(() => $`(esac)`);
+  await assertReservedWordError(
+    () =>
+      $`
+        echo 1
+        for
+      `,
+    " (line 2)",
+  );
+  // quoting suppresses the reserved word, leaving a command name that doesn't exist
+  assertEquals((await $`"if" foo`.noThrow().stderr("piped")).code, 127);
+
+  // the parser rejects with a string rather than an Error, so assertRejects can't be used here
+  async function assertReservedWordError(action: () => PromiseLike<unknown>, suffix = "") {
+    const error = await action().then(() => undefined, (error) => error);
+    assertStringIncludes(String(error), `Unsupported reserved word.${suffix}\n`);
+  }
+});
+
 // additional dax-specific coverage beyond deno_task_shell's two test functions
 Deno.test("command substitution: output whitespace is collapsed and the word is concatenated", async () => {
   // matches deno_task_shell's `echo test$(echo "1    2")` => `test1 2`
