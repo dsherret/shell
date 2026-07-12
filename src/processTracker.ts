@@ -72,7 +72,15 @@ export class ProcessTracker {
   #raise(event: ProcessTrackerEvent) {
     // copy in case a listener adds/removes listeners while being invoked
     for (const listener of [...this.#listeners]) {
-      listener(event);
+      try {
+        listener(event);
+      } catch (err) {
+        // a throwing listener must not corrupt tracking or alter command
+        // execution, so surface it as an uncaught error instead
+        queueMicrotask(() => {
+          throw err;
+        });
+      }
     }
   }
 
