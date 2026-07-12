@@ -17,6 +17,12 @@ export {
 } from "./src/command.ts";
 export type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "./src/commandHandler.ts";
 export {
+  ProcessTracker,
+  type ProcessTrackerEvent,
+  type ProcessTrackerListener,
+  type TrackedProcess,
+} from "./src/processTracker.ts";
+export {
   type AwaitableReadable,
   type Closer,
   type ErrorTailOptions,

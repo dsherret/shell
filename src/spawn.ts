@@ -16,6 +16,8 @@ export interface SpawnCommandOptions {
 }
 
 export interface SpawnedChildProcess {
+  /** OS process id, or `undefined` if the process failed to spawn. */
+  readonly pid: number | undefined;
   stdin(): WritableStream;
   stdout(): ReadableStream;
   stderr(): ReadableStream;
@@ -59,6 +61,9 @@ export function spawnCommand(path: string, options: SpawnCommandOptions): Spawne
     exitResolvers.reject(err);
   });
   return {
+    get pid() {
+      return child.pid;
+    },
     stdin() {
       return Writable.toWeb(child.stdin!);
     },

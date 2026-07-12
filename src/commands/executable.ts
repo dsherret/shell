@@ -51,6 +51,7 @@ export function createExecutableCommand(
     } catch (err) {
       throw checkMapCwdNotExistsError(cwd, err);
     }
+    const processRegistration = p.pid != null ? context.registerProcess({ pid: p.pid, path: resolvedPath }) : undefined;
     const listener = (signal: Signal) => p.kill(signal);
     context.signal.addListener(listener);
     const completeController = new AbortController();
@@ -102,6 +103,7 @@ export function createExecutableCommand(
         return { code: exitCode };
       }
     } finally {
+      processRegistration?.[Symbol.dispose]();
       completeController.abort();
       context.signal.removeListener(listener);
 
