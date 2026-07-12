@@ -2391,6 +2391,39 @@ Deno.test("should error creating a command signal", () => {
   );
 });
 
+Deno.test("kill signal: a throwing listener doesn't stop dispatch to the remaining listeners", () => {
+  // capture the rethrows instead of letting them become uncaught errors
+  const scheduled: VoidFunction[] = [];
+  const originalQueueMicrotask = globalThis.queueMicrotask;
+  globalThis.queueMicrotask = (fn: VoidFunction) => scheduled.push(fn);
+  try {
+    const controller = new KillController();
+    controller.signal.addListener(() => {
+      throw new Error("listener error");
+    });
+    const received: Signal[] = [];
+    controller.signal.addListener((signal) => received.push(signal));
+    controller.kill("SIGTERM"); // must not throw
+    assertEquals(received, ["SIGTERM"]);
+    assertEquals(scheduled.length, 1);
+    assertThrows(() => scheduled[0](), Error, "listener error");
+  } finally {
+    globalThis.queueMicrotask = originalQueueMicrotask;
+  }
+});
+
+Deno.test("kill signal: a listener removing itself doesn't skip the next listener", () => {
+  const controller = new KillController();
+  const received: Signal[] = [];
+  const selfRemoving = () => {
+    controller.signal.removeListener(selfRemoving);
+  };
+  controller.signal.addListener(selfRemoving);
+  controller.signal.addListener((signal) => received.push(signal));
+  controller.kill("SIGTERM");
+  assertEquals(received, ["SIGTERM"]);
+});
+
 Deno.test("should receive signal when listening", { ignore: process.platform !== "linux" }, async () => {
   const p =
     $`deno eval 'Deno.addSignalListener("SIGINT", () => console.log("RECEIVED SIGINT")); console.log("started"); setTimeout(() => {}, 10_000)'`
