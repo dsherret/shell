@@ -2039,8 +2039,18 @@ function sendSignalToState(state: KillSignalState, signal: Signal) {
   if (code !== undefined) {
     state.abortedCode = code;
   }
-  for (const listener of state.listeners) {
-    listener(signal);
+  // copy in case a listener adds/removes listeners while being invoked
+  for (const listener of [...state.listeners]) {
+    try {
+      listener(signal);
+    } catch (err) {
+      // a throwing listener must not prevent the remaining listeners from
+      // receiving the signal (ex. the ones forwarding the kill to child
+      // processes), so surface it as an uncaught error instead
+      queueMicrotask(() => {
+        throw err;
+      });
+    }
   }
 }
 
