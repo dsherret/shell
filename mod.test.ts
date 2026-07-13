@@ -2264,6 +2264,32 @@ Deno.test("cp -r with trailing dot copies directory contents", async () => {
     await $`mkdir dist3 && cd public && cp -r . ../dist3`;
     assert(dir.join("dist3/index.html").existsSync());
     assert(dir.join("dist3/.well-known/security.txt").existsSync());
+
+    // refuses to copy '..' since the target would resolve to the
+    // destination's parent directory
+    assertEquals(
+      await getStdErr($`cp -r public/.. dist`),
+      "cp: cannot copy 'public/..': refusing to copy '..'\n",
+    );
+    assertEquals(
+      await getStdErr($`cp -r .. dist`),
+      "cp: cannot copy '..': refusing to copy '..'\n",
+    );
+
+    // refuses to copy a directory to itself since that would
+    // truncate its files
+    assertEquals(
+      await getStdErr($`cp -r public/. public`),
+      "cp: 'public/.' and 'public' are the same file\n",
+    );
+    assertEquals(dir.join("public/index.html").readTextSync(), "test");
+
+    // same for copying a file to itself
+    assertEquals(
+      await getStdErr($`cp public/index.html public/index.html`),
+      "cp: 'public/index.html' and 'public/index.html' are the same file\n",
+    );
+    assertEquals(dir.join("public/index.html").readTextSync(), "test");
   });
 });
 

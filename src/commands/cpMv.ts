@@ -49,6 +49,13 @@ export async function parseCpArgs(cwd: string, args: string[]): Promise<CopyFlag
   if (paths.length === 0) throw Error("missing file operand");
   else if (paths.length === 1) throw Error(`missing destination file operand after '${paths[0]}'`);
 
+  for (const from of paths.slice(0, -1)) {
+    // a trailing `..` would resolve the target to the destination's
+    // parent directory, so refuse it like the guard in mv
+    if (path.basename(from) === "..") {
+      throw Error(`cannot copy '${from}': refusing to copy '..'`);
+    }
+  }
   return { recursive, operations: await getCopyAndMoveOperations(cwd, paths) };
 }
 
@@ -59,6 +66,10 @@ async function doCopyOperation(
 ) {
   // These are racy with the file system, but that's ok.
   // They only exists to give better error messages.
+  if (from.path === to.path) {
+    // copying to the same path truncates the source's files
+    throw Error(`'${from.specified}' and '${to.specified}' are the same file`);
+  }
   const fromInfo = await safeLstat(from.path);
   if (fromInfo?.isDirectory()) {
     if (flags.recursive) {
