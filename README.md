@@ -81,4 +81,4 @@ const result = await new CommandBuilder()
 console.log(result.stdout); // "hello friend\n"
 ```
 
-See [`mod.ts`](./mod.ts) for the full public API: `$`/`build$`, `CommandBuilder`, `CommandChild`, `CommandResult`, `KillController`/`KillSignal`, `escapeArg`, `createExecutableCommand`, file helpers (`create`, `open`, `FsFile`), and types for command handlers, pipes, and shell results.
+See [`mod.ts`](./mod.ts) for the full public API: `$`/`build$`, `CommandBuilder`, `CommandChild`, `CommandResult`, `KillController`/`KillSignal`, `ProcessTracker`, `escapeArg`, `createExecutableCommand`, file helpers (`create`, `open`, `FsFile`), and types for command handlers, pipes, and shell results.

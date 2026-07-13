@@ -16,6 +16,7 @@ import {
   ShellPipeWriter,
 } from "./pipes.ts";
 import { Buffer } from "@std/io/buffer";
+import { type ProcessTracker, registerTrackedProcess, type TrackedProcess } from "./processTracker.ts";
 import { type EnvChange, type ExecuteResult, getAbortedResult, type ShellOption } from "./result.ts";
 import { stdin as stdinStream } from "./streams.ts";
 
@@ -354,6 +355,7 @@ interface StaticContextState {
   signal: KillSignal;
   commands: Record<string, CommandHandler>;
   fds: StreamFds | undefined;
+  processTracker: ProcessTracker | undefined;
 }
 
 export class Context {
@@ -466,6 +468,11 @@ export class Context {
     this.#shellOptions[option] = value;
   }
 
+  registerProcess(process: TrackedProcess): Disposable {
+    const tracker = this.#static.processTracker;
+    return tracker != null ? registerTrackedProcess(tracker, process) : noopDisposable;
+  }
+
   getFdReader(fd: number) {
     return this.#static.fds?.getReader(fd);
   }
@@ -500,6 +507,9 @@ export class Context {
       },
       get shellOptions() {
         return context.getShellOptions();
+      },
+      registerProcess(process: TrackedProcess): Disposable {
+        return context.registerProcess(process);
       },
       error(codeOrText: number | string, maybeText?: string): Promise<ExecuteResult> | ExecuteResult {
         return context.error(codeOrText, maybeText);
@@ -569,6 +579,7 @@ export interface SpawnOpts {
   signal: KillSignal;
   fds: StreamFds | undefined;
   shellOptions?: Partial<ShellOptionsState>;
+  processTracker?: ProcessTracker;
 }
 
 function getDefaultShellOptions(list: SequentialList): ShellOptionsState {
@@ -606,6 +617,7 @@ export async function spawn(list: SequentialList, opts: SpawnOpts) {
       commands: opts.commands,
       fds: opts.fds,
       signal: opts.signal,
+      processTracker: opts.processTracker,
     },
   });
   const result = await executeSequentialList(list, context);
@@ -1580,3 +1592,9 @@ function isDisposable(value: unknown): value is Disposable {
 function isAsyncDisposable(value: unknown): value is AsyncDisposable {
   return value != null && typeof (value as any)[Symbol.asyncDispose] === "function";
 }
+
+const noopDisposable: Disposable = {
+  [Symbol.dispose]() {
+    // do nothing
+  },
+};

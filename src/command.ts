@@ -33,6 +33,7 @@ import {
   LoggerTreeBox,
   symbols,
 } from "./common.ts";
+import type { ProcessTracker } from "./processTracker.ts";
 import type { Signal } from "./signal.ts";
 import { stderr as stderrStream, stdout as stdoutStream } from "./streams.ts";
 import { ByteRingBuffer } from "./byteRingBuffer.ts";
@@ -109,6 +110,7 @@ interface CommandBuilderState {
   printCommandLogger: LoggerTreeBox;
   timeout: number | undefined;
   signal: KillSignal | undefined;
+  processTracker: ProcessTracker | undefined;
   encoding: string | undefined;
   shellOptions: Partial<ShellOptionsState>;
   beforeCommand: BeforeCommandCallback[] | undefined;
@@ -229,6 +231,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     ),
     timeout: undefined,
     signal: undefined,
+    processTracker: undefined,
     encoding: undefined,
     shellOptions: {},
     beforeCommand: undefined,
@@ -262,6 +265,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       printCommandLogger: state.printCommandLogger.createChild(),
       timeout: state.timeout,
       signal: state.signal,
+      processTracker: state.processTracker,
       encoding: state.encoding,
       shellOptions: { ...state.shellOptions },
       beforeCommand: state.beforeCommand,
@@ -484,6 +488,14 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         state.signal.linkChild(killSignal);
       }
       state.signal = killSignal;
+    });
+  }
+
+  /** Attaches a `ProcessTracker` for observing the OS processes spawned
+   * by this command while it executes (see {@link ProcessTracker}). */
+  processTracker(processTracker: ProcessTracker): CommandBuilder {
+    return this.#newWithState((state) => {
+      state.processTracker = processTracker;
     });
   }
 
@@ -1291,6 +1303,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
         signal,
         fds,
         shellOptions: state.shellOptions,
+        processTracker: state.processTracker,
       });
       if (code !== 0) {
         if (timedOut) {

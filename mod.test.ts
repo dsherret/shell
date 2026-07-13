@@ -14,8 +14,11 @@ import {
   createExecutableCommand,
   KillController,
   KillSignal,
+  ProcessTracker,
+  type ProcessTrackerEvent,
   ShellError,
   type Signal,
+  type TrackedProcess,
   whichRealEnv,
 } from "./mod.ts";
 import { $, ensurePromiseNotResolved, getStdErr, mk$, sleep, usingTempDir, withTempDir } from "./src/test/helpers.ts";
@@ -3416,4 +3419,77 @@ Deno.test("errorTail: combined with only one stream enabled captures just that s
   );
   assertStringIncludes(err.message, "err-only");
   assert(!err.message.includes("out-only"));
+});
+
+Deno.test("processTracker: tracks a spawned process until it exits", async () => {
+  const tracker = new ProcessTracker();
+  const events: ProcessTrackerEvent[] = [];
+  const firstSpawn = Promise.withResolvers<TrackedProcess>();
+  tracker.addListener((event) => {
+    events.push(event);
+    if (event.kind === "spawned") {
+      firstSpawn.resolve(event.process);
+    }
+  });
+  assertEquals(tracker.processes.length, 0);
+  const child = $`deno eval 'await new Promise((resolve) => setTimeout(resolve, 60_000));'`
+    .processTracker(tracker)
+    .noThrow()
+    .spawn();
+  const trackedProcess = await firstSpawn.promise;
+  assert(trackedProcess.pid > 0);
+  assertStringIncludes(trackedProcess.path.toLowerCase(), "deno");
+  assertEquals(tracker.processes, [trackedProcess]);
+  child.kill("SIGKILL");
+  await child;
+  assertEquals(tracker.processes.length, 0);
+  assertEquals(events.map((e) => e.kind), ["spawned", "exited"]);
+});
+
+Deno.test("processTracker: tracks each process in a pipeline", async () => {
+  const tracker = new ProcessTracker();
+  const events: ProcessTrackerEvent[] = [];
+  tracker.addListener((event) => events.push(event));
+  const text =
+    await $`deno eval 'console.log(1)' | deno eval 'const t = await new Response(Deno.stdin.readable).text(); console.log(t.trim())'`
+      .processTracker(tracker)
+      .text();
+  assertEquals(text, "1");
+  assertEquals(events.filter((e) => e.kind === "spawned").length, 2);
+  assertEquals(events.filter((e) => e.kind === "exited").length, 2);
+  assertEquals(tracker.processes.length, 0);
+});
+
+Deno.test("processTracker: built-in commands don't spawn processes", async () => {
+  const tracker = new ProcessTracker();
+  const events: ProcessTrackerEvent[] = [];
+  tracker.addListener((event) => events.push(event));
+  const text = await $`echo 1 && sleep 0.01`.processTracker(tracker).text();
+  assertEquals(text, "1");
+  assertEquals(events.length, 0);
+});
+
+Deno.test("processTracker: custom command handlers can register processes", async () => {
+  const tracker = new ProcessTracker();
+  const events: ProcessTrackerEvent[] = [];
+  tracker.addListener((event) => events.push(event));
+  const $local = mk$(new CommandBuilder().registerCommand("my-spawn", (context) => {
+    const registration = context.registerProcess({ pid: 1234, path: "/some/exe" });
+    assertEquals(tracker.processes.map((p) => p.pid), [1234]);
+    registration[Symbol.dispose]();
+    return { code: 0 };
+  }));
+  await $local`my-spawn`.processTracker(tracker);
+  assertEquals(events.map((e) => e.kind), ["spawned", "exited"]);
+  assertEquals(tracker.processes.length, 0);
+});
+
+Deno.test("processTracker: removeListener stops notifications", async () => {
+  const tracker = new ProcessTracker();
+  const events: ProcessTrackerEvent[] = [];
+  const listener = (event: ProcessTrackerEvent) => events.push(event);
+  tracker.addListener(listener);
+  tracker.removeListener(listener);
+  await $`deno eval 'console.log(1)'`.processTracker(tracker).text();
+  assertEquals(events.length, 0);
 });

@@ -1,5 +1,6 @@
 import type { KillSignal } from "./command.ts";
 import type { Reader, ShellPipeWriterKind } from "./pipes.ts";
+import type { TrackedProcess } from "./processTracker.ts";
 import type { ExecuteResult } from "./result.ts";
 import type { ShellOptionsState } from "./shell.ts";
 
@@ -38,6 +39,10 @@ export interface CommandContext {
   get signal(): KillSignal;
   /** Current shell options (nullglob, failglob, pipefail, globstar). */
   get shellOptions(): ShellOptionsState;
+  /** Registers an OS process spawned on behalf of this command so any
+   * attached `ProcessTracker` can observe it. Dispose the returned value
+   * when the process exits. No-op when no tracker is attached. */
+  registerProcess(process: TrackedProcess): Disposable;
   /** Helper function for writing a line to stderr and returning a 1 exit code. */
   error(message: string): Promise<ExecuteResult> | ExecuteResult;
   /** Helper function for writing a line to stderr and returning the provided exit code. */
