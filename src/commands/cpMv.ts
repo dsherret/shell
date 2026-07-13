@@ -113,7 +113,15 @@ export async function parseMvArgs(cwd: string, args: string[]): Promise<MoveFlag
   if (paths.length === 0) throw Error("missing operand");
   else if (paths.length === 1) throw Error(`missing destination file operand after '${paths[0]}'`);
 
-  return { operations: await getCopyAndMoveOperations(cwd, paths) };
+  const operations = await getCopyAndMoveOperations(cwd, paths);
+  for (const operation of operations) {
+    // matches GNU mv, which errors renaming these (ex. `mv public/. dist`)
+    const basename = path.basename(operation.from.specified);
+    if (basename === "." || basename === "..") {
+      throw Error(`cannot move '${operation.from.specified}': refusing to move '.' or '..'`);
+    }
+  }
+  return { operations };
 }
 
 async function getCopyAndMoveOperations(
@@ -131,7 +139,7 @@ async function getCopyAndMoveOperations(
     }
     for (const from of fromArgs) {
       const fromPath = resolvePath(cwd, from);
-      const toPath = path.join(destination, path.basename(fromPath));
+      const toPath = calculateDestinationPath(destination, from);
       operations.push(
         {
           from: {
@@ -149,7 +157,7 @@ async function getCopyAndMoveOperations(
     const fromPath = resolvePath(cwd, fromArgs[0]);
 
     const toPath = await safeLstat(destination).then((p) => p?.isDirectory())
-      ? calculateDestinationPath(destination, fromPath)
+      ? calculateDestinationPath(destination, fromArgs[0])
       : destination;
 
     operations.push({
@@ -167,11 +175,17 @@ async function getCopyAndMoveOperations(
 }
 
 /**  Calculates destination path
- * destination should be a directory
+ * destination should be a directory and from should be
+ * the path as specified on the command line
  * example:
  *          destination: /dir/a
  *          from       : /path/file
  *          returns    : /dir/a/file
+ *
+ * The basename is taken from the path as specified rather than
+ * the resolved path so that a trailing `.` resolves to the
+ * destination itself like GNU cp (ex. `cp -r public/. dist`
+ * copies the contents of `public` into `dist`).
  */
 function calculateDestinationPath(destination: string, from: string) {
   return path.join(destination, path.basename(from));

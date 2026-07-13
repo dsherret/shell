@@ -2243,6 +2243,30 @@ Deno.test("cp test2", async () => {
   });
 });
 
+Deno.test("cp -r with trailing dot copies directory contents", async () => {
+  await withTempDir(async (dir) => {
+    // https://github.com/denoland/deno_task_shell/issues/176
+    await $`mkdir -p public/.well-known`;
+    dir.join("public/index.html").writeSync("test");
+    dir.join("public/.well-known/security.txt").writeSync("test");
+
+    await $`mkdir dist`;
+    await $`cp -r public/. dist/`;
+    assert(!dir.join("dist/public").existsSync());
+    assert(dir.join("dist/index.html").existsSync());
+    assert(dir.join("dist/.well-known/security.txt").existsSync());
+
+    // non-existent destination
+    await $`cp -r public/. dist2`;
+    assert(dir.join("dist2/index.html").existsSync());
+
+    // "." as the entire source
+    await $`mkdir dist3 && cd public && cp -r . ../dist3`;
+    assert(dir.join("dist3/index.html").existsSync());
+    assert(dir.join("dist3/.well-known/security.txt").existsSync());
+  });
+});
+
 Deno.test("move test", async () => {
   await withTempDir(async (dir) => {
     const file1 = dir.join("file1.txt");
@@ -2276,6 +2300,19 @@ Deno.test("move test", async () => {
 
     assertEquals(await getStdErr($`mv`), "mv: missing operand\n");
     assertStringIncludes(await getStdErr($`mv ${file1}`), "mv: missing destination file operand after");
+
+    // refuses to move '.' or '..' like GNU mv
+    const otherDir = dir.join("other");
+    otherDir.mkdirSync();
+    assertEquals(
+      await getStdErr($`mv dest/. other`),
+      "mv: cannot move 'dest/.': refusing to move '.' or '..'\n",
+    );
+    assertEquals(
+      await getStdErr($`mv .. other`),
+      "mv: cannot move '..': refusing to move '.' or '..'\n",
+    );
+    assert(destDir.join("file1.txt").existsSync());
   });
 });
 
