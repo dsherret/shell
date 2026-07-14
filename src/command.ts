@@ -96,7 +96,7 @@ export interface CommandBuilderStateCommand {
   fds: StreamFds | undefined;
   /** Command builders interpolated into the template literal, keyed by the
    * id found in their sentinel within the text. */
-  commandRefs: Map<number, CommandBuilder> | undefined;
+  commandRefs?: Map<number, CommandBuilder> | undefined;
 }
 
 interface CommandBuilderState {
@@ -196,9 +196,11 @@ export const getRegisteredCommandNamesSymbol: unique symbol = Symbol();
 /** @internal */
 export const setCommandTextStateSymbol: unique symbol = Symbol();
 
-// module-private accessor to a builder's state, assigned in the
-// class's static block so it can reach the private field
+// module-private accessors assigned in the class's static block so they
+// can reach the private members
 let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilderState>;
+// replaces the signal without `.signal()`'s permanent link to the previous one
+let commandBuilderWithSignal: (builder: CommandBuilder, signal: KillSignal) => CommandBuilder;
 
 /**
  * Underlying builder API for executing commands.
@@ -223,6 +225,10 @@ let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilder
 export class CommandBuilder implements PromiseLike<CommandResult> {
   static {
     getCommandBuilderState = (builder) => builder.#state;
+    commandBuilderWithSignal = (builder, signal) =>
+      builder.#newWithState((state) => {
+        state.signal = signal;
+      });
   }
 
   #state: Readonly<CommandBuilderState> = {
@@ -313,7 +319,20 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     // the thrown error's async chain.
     const callerStack = captureCallerStack(this.then);
     return this.#resolveStateForSpawn()
-      .then((state) => parseAndSpawnCommand(state, callerStack).then(onfulfilled).catch(onrejected));
+      .then((state) => {
+        try {
+          return parseAndSpawnCommand(state, callerStack);
+        } catch (err) {
+          // a synchronous throw (ex. no command set) must still reach
+          // `onrejected` below — rethrowing inside the callback rejects the
+          // chained promise, whereas the previous
+          // `parseAndSpawnCommand(...).then(onfulfilled).catch(onrejected)`
+          // shape never attached the handlers, leaving awaiters hanging
+          attachCallerStack(err, callerStack);
+          throw err;
+        }
+      })
+      .then(onfulfilled, onrejected);
   }
 
   /**
@@ -1838,12 +1857,9 @@ function buildCommandRefInvokers(
   const invokers = new Map<number, CommandRefInvoker>();
   for (const [id, refBuilder] of commandRefs) {
     invokers.set(id, async ({ stderr, signal }) => {
-      // use an intermediate controller so killing the evaluating command
-      // kills the interpolated command, but not the other way around
-      const controller = new KillController();
-      const link = signal.linkChild(controller.signal);
+      const linked = linkInterpolatedCommandSignals(refBuilder, signal);
       try {
-        let builder = refBuilder.stdout("piped").signal(controller.signal);
+        let builder = linked.builder.stdout("piped");
         if (getCommandBuilderState(refBuilder).stderr.kind === "inherit") {
           // inherit from the evaluating command instead of the process
           builder = builder.stderr(writableStreamFromShellPipeWriter(stderr));
@@ -1860,11 +1876,41 @@ function buildCommandRefInvokers(
           code: err instanceof ShellError ? err.exitCode : 1,
         };
       } finally {
-        link.unsubscribe();
+        linked.unsubscribe();
       }
     });
   }
   return invokers;
+}
+
+/** Gives an interpolated command builder a fresh signal that gets killed by
+ * the evaluating command's signal and the builder's own signal (but not the
+ * other way around), with the links removable once the invocation finishes. */
+function linkInterpolatedCommandSignals(
+  refBuilder: CommandBuilder,
+  outerSignal: KillSignal | undefined,
+): { builder: CommandBuilder; unsubscribe(): void } {
+  const controller = new KillController();
+  const links: { unsubscribe(): void }[] = [];
+  const ownSignal = getCommandBuilderState(refBuilder).signal;
+  if (outerSignal != null) {
+    links.push(outerSignal.linkChild(controller.signal));
+  }
+  if (ownSignal != null) {
+    links.push(ownSignal.linkChild(controller.signal));
+  }
+  // linkChild only forwards future kills, so propagate an existing abort
+  if (outerSignal?.aborted || ownSignal?.aborted) {
+    controller.kill();
+  }
+  return {
+    builder: commandBuilderWithSignal(refBuilder, controller.signal),
+    unsubscribe() {
+      for (const link of links) {
+        link.unsubscribe();
+      }
+    },
+  };
 }
 
 /** Gets the command text with any command ref sentinels replaced with the
@@ -2240,7 +2286,7 @@ function templateInner(
           if (expr instanceof Path) {
             text += templateLiteralExprToString(expr, escape, registerCommandRef);
           } else if (expr instanceof CommandBuilder) {
-            handleReadableStream(() => expr.stdout("piped").spawn().stdout());
+            handleCommandBuilderRedirect(unwrapCommandBuilder(expr) ?? expr);
           } else if (typeof expr === "string") {
             handleReadableStream(() =>
               new ReadableStream({
@@ -2413,6 +2459,35 @@ function templateInner(
     });
     text = text.trimEnd() + "&" + fd;
   }
+
+  function handleCommandBuilderRedirect(builder: CommandBuilder) {
+    streams ??= new StreamFds();
+    const fd = nextStreamFd++;
+    streams.insertReader(fd, (opts) => {
+      const linked = linkInterpolatedCommandSignals(builder, opts?.signal);
+      let child: CommandChild;
+      try {
+        child = linked.builder.stdout("piped").spawn();
+      } catch (err) {
+        linked.unsubscribe();
+        throw new Error(`Failed spawning interpolated command for input redirect. ${errorToString(err)}`);
+      }
+      const stream = child.stdout();
+      const reader = stream.getReader();
+      return {
+        ...readerFromStreamReader(reader),
+        [Symbol.dispose]() {
+          linked.unsubscribe();
+          reader.releaseLock();
+          // kills the interpolated command when it hasn't finished
+          stream.cancel().catch(() => {
+            // ignore, the stream may have errored
+          });
+        },
+      };
+    });
+    text = text.trimEnd() + "&" + fd;
+  }
 }
 
 function detectInputOrOutputRedirect(text: string) {
@@ -2442,7 +2517,8 @@ function templateLiteralExprToString(
   } else if (expr instanceof CommandBuilder) {
     // substitute a sentinel that the executor lazily resolves to the
     // command builder's stdout when evaluating the surrounding word
-    return registerCommandRef(expr);
+    // (unwrapping the non-thenable proxy handed to beforeCommand callbacks)
+    return registerCommandRef(unwrapCommandBuilder(expr) ?? expr);
   } else if (expr instanceof RawArg) {
     return templateLiteralExprToString(expr.value, undefined, registerCommandRef);
   } else if (typeof expr === "object" && expr.toString === Object.prototype.toString) {

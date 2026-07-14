@@ -317,11 +317,18 @@ function cloneEnv(env: Env) {
   return result;
 }
 
+export interface StreamFdReaderOpts {
+  /** Signal of the command the stream is redirected into, so stream
+   * factories that spawn work (ex. interpolated command builders) can be
+   * killed along with it. */
+  signal: KillSignal;
+}
+
 export class StreamFds {
-  #readers = new Map<number, () => Reader>();
+  #readers = new Map<number, (opts?: StreamFdReaderOpts) => Reader>();
   #writers = new Map<number, () => PipeWriter>();
 
-  insertReader(fd: number, stream: () => Reader) {
+  insertReader(fd: number, stream: (opts?: StreamFdReaderOpts) => Reader) {
     this.#readers.set(fd, stream);
   }
 
@@ -329,8 +336,8 @@ export class StreamFds {
     this.#writers.set(fd, stream);
   }
 
-  getReader(fd: number): Reader | undefined {
-    return this.#readers.get(fd)?.();
+  getReader(fd: number, opts?: StreamFdReaderOpts): Reader | undefined {
+    return this.#readers.get(fd)?.(opts);
   }
 
   getWriter(fd: number): PipeWriter | undefined {
@@ -513,7 +520,7 @@ export class Context {
   }
 
   getFdReader(fd: number) {
-    return this.#static.fds?.getReader(fd);
+    return this.#static.fds?.getReader(fd, { signal: this.#static.signal });
   }
 
   getFdWriter(fd: number) {
@@ -1238,6 +1245,11 @@ async function executeSimpleCommand(command: SimpleCommand, parentContext: Conte
 }
 
 function executeCommandArgs(commandArgs: string[], context: Context): Promise<ExecuteResult> {
+  // a command that expanded to nothing (ex. `$(true)` or an interpolated
+  // command with empty output) is a no-op like in other shells
+  if (commandArgs.length === 0) {
+    return Promise.resolve({ code: 0 });
+  }
   // look for a registered command first
   const commandName = commandArgs.shift()!;
   const command = context.getCommand(commandName);

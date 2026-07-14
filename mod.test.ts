@@ -2966,6 +2966,87 @@ Deno.test("command builder interpolation - killing the outer command kills the i
   assert(Date.now() - start < 5_000, "should have been killed quickly");
 });
 
+Deno.test("command builder interpolation - unquoted output word-splits into args, quoted stays one arg", async () => {
+  const cmd = $`echo '1   2'`;
+  const printArgs = "console.log(JSON.stringify(Deno.args))";
+  assertEquals(JSON.parse(await $`deno eval -q ${printArgs} ${cmd}`.text()), ["1", "2"]);
+  assertEquals(JSON.parse(await $`deno eval -q ${printArgs} "${cmd}"`.text()), ["1 2"]);
+});
+
+Deno.test("command builder interpolation - pipeline and command name positions", async () => {
+  assertEquals(await $`echo ${$`echo hi`} | cat`.text(), "hi");
+  assertEquals(await $`${$`echo echo`} hi`.text(), "hi");
+});
+
+Deno.test("command builder interpolation - runs once per brace expansion", async () => {
+  let runCount = 0;
+  const cmd = $`echo 1`.beforeCommandSync(() => {
+    runCount++;
+  });
+  assertEquals(await $`echo {a,b}${cmd}`.text(), "a1 b1");
+  assertEquals(runCount, 2);
+});
+
+Deno.test("command builder interpolation - empty output as the whole command is a no-op", async () => {
+  const result = await $`${$`echo`}`.noThrow();
+  assertEquals(result.code, 0);
+});
+
+Deno.test("command builder interpolation - builder without a command errors instead of hanging", async () => {
+  const result = await $`echo ${new CommandBuilder()}`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 1);
+  assertStringIncludes(result.stderr, "A command must be set");
+});
+
+Deno.test("awaiting a command builder without a command rejects", async () => {
+  await assertRejects(
+    async () => {
+      await new CommandBuilder();
+    },
+    Error,
+    "A command must be set before it can be spawned.",
+  );
+});
+
+Deno.test("command builder interpolation - builder from a beforeCommand callback", async () => {
+  let captured: CommandBuilder | undefined;
+  await $`echo inner`.stdout("null").beforeCommand((builder) => {
+    captured = builder;
+  });
+  assertEquals(await $`echo ${captured!}`.text(), "inner");
+});
+
+Deno.test("command builder interpolation - already-aborted outer command doesn't run the inner command", async () => {
+  const inner = $`sleep 100`;
+  const child = $`echo $(sleep 5) ${inner}`.stdout("piped").stderr("piped").spawn();
+  await sleep(200); // let the substitution start
+  const start = Date.now();
+  child.kill();
+  await assertRejects(() => child, ShellError, "Aborted");
+  assert(Date.now() - start < 5_000, "should have been killed quickly");
+});
+
+Deno.test("command builder interpolation - killing the outer command kills an input redirect command", async () => {
+  const child = $`cat < ${$`sleep 100`}`.stdout("piped").stderr("piped").spawn();
+  await sleep(200); // give the inner command time to start
+  const start = Date.now();
+  child.kill();
+  await assertRejects(() => child, ShellError, "Aborted");
+  assert(Date.now() - start < 5_000, "should have been killed quickly");
+});
+
+Deno.test("command builder interpolation - inner command's own signal only kills the inner command", async () => {
+  const controller = new KillController();
+  const inner = $`sleep 100`.signal(controller.signal);
+  const child = $`echo ${inner}`.stdout("piped").stderr("piped").spawn();
+  await sleep(200); // give the inner command time to start
+  const start = Date.now();
+  controller.kill();
+  // the outer command fails from the inner abort, but is not itself aborted
+  await assertRejects(() => child, ShellError, "Exited with code: 124");
+  assert(Date.now() - start < 5_000, "should have been killed quickly");
+});
+
 Deno.test("command builder interpolation - printCommand shows the inner command text", async () => {
   const logs: string[] = [];
   const inner = $`echo 1`;

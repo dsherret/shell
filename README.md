@@ -52,7 +52,11 @@ await $`echo 'hello ${name}'`; // works inside quotes too
 await $`cat < ${name}`; // or as an input redirect
 ```
 
-The interpolated command runs lazily when the surrounding command evaluates its arguments, so it never runs when short-circuited away (ex. the interpolated command in `` $`exit 1 && echo ${cmd}` `` doesn't run). It executes with its own configuration (env, cwd, etc.), except stdout is captured and stderr defaults to the evaluating command's stderr. If it fails, the surrounding command fails with its exit code—add `.noThrow()` to the interpolated command to tolerate failure.
+The interpolated command runs lazily when the surrounding command evaluates its arguments, so it never runs when short-circuited away (ex. the interpolated command in `` $`exit 1 && echo ${cmd}` `` doesn't run). It executes with its own configuration (env, cwd, etc.), except stdout is captured and stderr defaults to the evaluating command's stderr. If it fails, the command evaluating it fails with its exit code—add `.noThrow()` to the interpolated command to tolerate failure.
+
+Like `$(...)`, an unquoted substitution word-splits its output into multiple arguments and expands glob characters—interpolate inside quotes (ex. `` $`echo "${cmd}"` ``) to keep it a single argument.
+
+In input redirect position, `` $`cat < ${cmd}` `` streams the command's raw stdout directly to the redirect (no capture or word splitting), while a quoted `` $`cat < "${cmd}"` `` substitutes its output as a file path to read.
 
 ### `build$`
 
