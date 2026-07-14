@@ -2290,6 +2290,13 @@ Deno.test("cp -r with trailing dot copies directory contents", async () => {
       "cp: 'public/index.html' and 'public/index.html' are the same file\n",
     );
     assertEquals(dir.join("public/index.html").readTextSync(), "test");
+
+    // refuses the root as a source since it has no name to place
+    // inside the destination
+    assertEquals(
+      await getStdErr($`cp -r / dist`),
+      "cp: cannot copy '/': the source has no final path component\n",
+    );
   });
 });
 
@@ -2339,6 +2346,13 @@ Deno.test("move test", async () => {
       "mv: cannot move '..': refusing to move '.' or '..'\n",
     );
     assert(destDir.join("file1.txt").existsSync());
+
+    // refuses the root as a source since it has no name to place
+    // inside the destination
+    assertEquals(
+      await getStdErr($`mv / other`),
+      "mv: cannot move '/': the source has no final path component\n",
+    );
   });
 });
 
