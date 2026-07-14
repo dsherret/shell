@@ -50,10 +50,15 @@ export async function parseCpArgs(cwd: string, args: string[]): Promise<CopyFlag
   else if (paths.length === 1) throw Error(`missing destination file operand after '${paths[0]}'`);
 
   for (const from of paths.slice(0, -1)) {
+    const basename = path.basename(from);
     // a trailing `..` would resolve the target to the destination's
     // parent directory, so refuse it like the guard in mv
-    if (path.basename(from) === "..") {
+    if (basename === "..") {
       throw Error(`cannot copy '${from}': refusing to copy '..'`);
+    } else if (basename === "") {
+      // an empty final component means the source is the root (ex. `/`),
+      // which has no name to place inside the destination
+      throw Error(`cannot copy '${from}': the source has no final path component`);
     }
   }
   return { recursive, operations: await getCopyAndMoveOperations(cwd, paths) };
@@ -64,12 +69,12 @@ async function doCopyOperation(
   from: PathWithSpecified,
   to: PathWithSpecified,
 ) {
-  // These are racy with the file system, but that's ok.
-  // They only exists to give better error messages.
   if (from.path === to.path) {
     // copying to the same path truncates the source's files
     throw Error(`'${from.specified}' and '${to.specified}' are the same file`);
   }
+  // These are racy with the file system, but that's ok.
+  // They only exists to give better error messages.
   const fromInfo = await safeLstat(from.path);
   if (fromInfo?.isDirectory()) {
     if (flags.recursive) {
@@ -124,15 +129,18 @@ export async function parseMvArgs(cwd: string, args: string[]): Promise<MoveFlag
   if (paths.length === 0) throw Error("missing operand");
   else if (paths.length === 1) throw Error(`missing destination file operand after '${paths[0]}'`);
 
-  const operations = await getCopyAndMoveOperations(cwd, paths);
-  for (const operation of operations) {
+  for (const from of paths.slice(0, -1)) {
+    const basename = path.basename(from);
     // matches GNU mv, which errors renaming these (ex. `mv public/. dist`)
-    const basename = path.basename(operation.from.specified);
     if (basename === "." || basename === "..") {
-      throw Error(`cannot move '${operation.from.specified}': refusing to move '.' or '..'`);
+      throw Error(`cannot move '${from}': refusing to move '.' or '..'`);
+    } else if (basename === "") {
+      // an empty final component means the source is the root (ex. `/`),
+      // which has no name to place inside the destination
+      throw Error(`cannot move '${from}': the source has no final path component`);
     }
   }
-  return { operations };
+  return { operations: await getCopyAndMoveOperations(cwd, paths) };
 }
 
 async function getCopyAndMoveOperations(
@@ -197,6 +205,10 @@ async function getCopyAndMoveOperations(
  * the resolved path so that a trailing `.` resolves to the
  * destination itself like GNU cp (ex. `cp -r public/. dist`
  * copies the contents of `public` into `dist`).
+ *
+ * Sources with no final path component (a trailing `..` or the
+ * root) are refused by both cp and mv before getting here, so
+ * the basename is never empty.
  */
 function calculateDestinationPath(destination: string, from: string) {
   return path.join(destination, path.basename(from));
