@@ -21,6 +21,12 @@ import { type EnvChange, type ExecuteResult, getAbortedResult, type ShellOption 
 import { stdin as stdinStream } from "./streams.ts";
 
 class ShellEvaluateError extends Error {
+  readonly code: number;
+
+  constructor(message: string, code = 1) {
+    super(message);
+    this.code = code;
+  }
 }
 
 export interface SequentialList {
@@ -68,7 +74,7 @@ export interface SimpleCommand {
 
 export type Word = WordPart[];
 
-export type WordPart = Text | Variable | StringPartCommand | Quoted | Tilde | Brace;
+export type WordPart = Text | Variable | StringPartCommand | Quoted | Tilde | Brace | CommandRef;
 export type TextPart = Text | {
   kind: "quoted";
   value: string;
@@ -101,6 +107,14 @@ export interface Tilde {
 export interface Brace {
   kind: "brace";
   value: Word[];
+}
+
+/** Reference to a command builder interpolated into a template literal
+ * (ex. `` $`echo ${$`echo 1`}` ``). Never produced by the parser — created
+ * by {@link replaceCommandRefSentinels} after parsing. */
+export interface CommandRef {
+  kind: "commandRef";
+  id: number;
 }
 
 export interface Subshell extends SequentialList {
@@ -350,11 +364,36 @@ export interface ShellOptionsState {
   errexit: boolean;
 }
 
+/** Runs a command builder interpolated into a template literal, resolving
+ * to its captured stdout text or a failure. Implemented by the command
+ * layer and invoked lazily by the executor when word evaluation reaches
+ * the corresponding {@link CommandRef}. */
+export type CommandRefInvoker = (opts: CommandRefInvokerOpts) => Promise<CommandRefResult>;
+
+export interface CommandRefInvokerOpts {
+  /** The evaluating command's stderr for the interpolated command to
+   * inherit. */
+  stderr: ShellPipeWriter;
+  /** Signal of the evaluating command so it can kill the interpolated
+   * command. */
+  signal: KillSignal;
+}
+
+export type CommandRefResult = {
+  kind: "text";
+  text: string;
+} | {
+  kind: "failure";
+  message: string;
+  code: number;
+};
+
 /** State that never changes across the entire execution of the shell. */
 interface StaticContextState {
   signal: KillSignal;
   commands: Record<string, CommandHandler>;
   fds: StreamFds | undefined;
+  commandRefs: Map<number, CommandRefInvoker> | undefined;
   processTracker: ProcessTracker | undefined;
 }
 
@@ -481,6 +520,10 @@ export class Context {
     return this.#static.fds?.getWriter(fd);
   }
 
+  getCommandRefInvoker(id: number) {
+    return this.#static.commandRefs?.get(id);
+  }
+
   asCommandContext(args: string[]): CommandContext {
     const context = this;
     return {
@@ -567,6 +610,136 @@ export function parseCommand(command: string): SequentialList {
   return wasmInstance.parse(command) as SequentialList;
 }
 
+/** Gets the text to substitute into a command for an interpolated command
+ * builder. The executor later resolves it to a {@link CommandRef} via
+ * {@link replaceCommandRefSentinels}. The NUL delimiters can't appear in
+ * normal command text and the per-process random nonce makes the sentinel
+ * impossible to forge from interpolated (escaped) user text. */
+export function commandRefSentinel(id: number): string {
+  return `\0${commandRefNonce}:${id}\0`;
+}
+
+const commandRefNonce = Array.from(
+  crypto.getRandomValues(new Uint8Array(8)),
+  (byte) => byte.toString(16).padStart(2, "0"),
+).join("");
+const commandRefSentinelPattern = new RegExp(`\0${commandRefNonce}:(\\d+)\0`, "g");
+
+/** Replaces command ref sentinels in display text (ex. for `printCommand`). */
+export function replaceCommandRefSentinelsInText(text: string, replacer: (id: number) => string): string {
+  return text.replace(commandRefSentinelPattern, (_match, id) => replacer(Number(id)));
+}
+
+/** Replaces command ref sentinels found in the parsed AST's text word parts
+ * with {@link CommandRef} word parts so the executor can lazily evaluate the
+ * interpolated command builders. */
+export function replaceCommandRefSentinels(list: SequentialList): void {
+  visitList(list);
+
+  function visitList(list: SequentialList) {
+    for (const item of list.items) {
+      visitSequence(item.sequence);
+    }
+  }
+
+  function visitSequence(sequence: Sequence) {
+    switch (sequence.kind) {
+      case "shellVar":
+        visitWord(sequence.value);
+        break;
+      case "pipeline":
+        visitPipelineInner(sequence.inner);
+        break;
+      case "booleanList":
+        visitSequence(sequence.current);
+        visitSequence(sequence.next);
+        break;
+      default: {
+        const _assertNever: never = sequence;
+        break;
+      }
+    }
+  }
+
+  function visitPipelineInner(inner: PipelineInner) {
+    if (inner.kind === "pipeSequence") {
+      visitCommand(inner.current);
+      visitPipelineInner(inner.next);
+    } else {
+      visitCommand(inner);
+    }
+  }
+
+  function visitCommand(command: Command) {
+    if (command.redirect != null && command.redirect.ioFile.kind === "word") {
+      visitWord(command.redirect.ioFile.value);
+    }
+    if (command.inner.kind === "simple") {
+      for (const envVar of command.inner.envVars) {
+        visitWord(envVar.value);
+      }
+      for (const arg of command.inner.args) {
+        visitWord(arg);
+      }
+    } else {
+      visitList(command.inner);
+    }
+  }
+
+  function visitWord(word: Word) {
+    const newParts = visitParts(word);
+    word.splice(0, word.length, ...newParts);
+  }
+
+  function visitParts(parts: WordPart[]): WordPart[] {
+    const result: WordPart[] = [];
+    for (const part of parts) {
+      switch (part.kind) {
+        case "text":
+          result.push(...splitTextPart(part));
+          break;
+        case "quoted":
+          part.value = visitParts(part.value);
+          result.push(part);
+          break;
+        case "brace":
+          for (const word of part.value) {
+            visitWord(word);
+          }
+          result.push(part);
+          break;
+        case "command":
+          visitList(part.value);
+          result.push(part);
+          break;
+        default:
+          result.push(part);
+          break;
+      }
+    }
+    return result;
+  }
+
+  function splitTextPart(part: Text): WordPart[] {
+    if (!part.value.includes("\0")) {
+      return [part];
+    }
+    const result: WordPart[] = [];
+    let lastIndex = 0;
+    for (const match of part.value.matchAll(commandRefSentinelPattern)) {
+      if (match.index > lastIndex) {
+        result.push({ kind: "text", value: part.value.substring(lastIndex, match.index) });
+      }
+      result.push({ kind: "commandRef", id: Number(match[1]) });
+      lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < part.value.length) {
+      result.push({ kind: "text", value: part.value.substring(lastIndex) });
+    }
+    return result;
+  }
+}
+
 export interface SpawnOpts {
   stdin: CommandPipeReader;
   stdout: ShellPipeWriter;
@@ -578,6 +751,7 @@ export interface SpawnOpts {
   clearedEnv: boolean;
   signal: KillSignal;
   fds: StreamFds | undefined;
+  commandRefs?: Map<number, CommandRefInvoker>;
   shellOptions?: Partial<ShellOptionsState>;
   processTracker?: ProcessTracker;
 }
@@ -616,6 +790,7 @@ export async function spawn(list: SequentialList, opts: SpawnOpts) {
     static: {
       commands: opts.commands,
       fds: opts.fds,
+      commandRefs: opts.commandRefs,
       signal: opts.signal,
       processTracker: opts.processTracker,
     },
@@ -767,7 +942,16 @@ async function executeBooleanList(list: BooleanList, context: Context): Promise<
 }
 
 async function executeShellVar(sequence: ShellVar, context: Context): Promise<ExecuteResult> {
-  const value = await evaluateWord(sequence.value, context);
+  let value: string;
+  try {
+    value = await evaluateWord(sequence.value, context);
+  } catch (err) {
+    if (err instanceof ShellEvaluateError) {
+      return context.error(err.code, err.message);
+    } else {
+      throw err;
+    }
+  }
   return {
     code: 0,
     changes: [{
@@ -793,7 +977,16 @@ function executePipelineInner(inner: PipelineInner, context: Context): Promise<E
 
 async function executeCommand(command: Command, context: Context): Promise<ExecuteResult> {
   if (command.redirect != null) {
-    const redirectResult = await resolveRedirectPipe(command.redirect, context);
+    let redirectResult: ResolvedRedirectPipe | ExecuteResult;
+    try {
+      redirectResult = await resolveRedirectPipe(command.redirect, context);
+    } catch (err) {
+      if (err instanceof ShellEvaluateError) {
+        return context.error(err.code, err.message);
+      } else {
+        throw err;
+      }
+    }
     let redirectPipe: Reader | PipeWriter;
     if (redirectResult.kind === "input") {
       const { pipe } = redirectResult;
@@ -1037,7 +1230,7 @@ async function executeSimpleCommand(command: SimpleCommand, parentContext: Conte
     return await executeCommandArgs(commandArgs, context);
   } catch (err) {
     if (err instanceof ShellEvaluateError) {
-      return context.error(err.message);
+      return context.error(err.code, err.message);
     } else {
       throw err;
     }
@@ -1532,6 +1725,9 @@ async function evaluateWordPartsInner(wordParts: WordPart[], context: Context, q
       case "command":
         evaluationResult = await evaluateCommandSubstitution(stringPart.value, context);
         break;
+      case "commandRef":
+        evaluationResult = await evaluateCommandRef(stringPart.id, context);
+        break;
       case "brace":
         // brace parts are expanded by `expandBraces` before we ever reach here
         throw new Error("brace parts must be expanded before evaluation");
@@ -1583,6 +1779,27 @@ async function evaluateCommandSubstitution(list: SequentialList, context: Contex
   await executeSequentialList(list, subContext);
   const text = new TextDecoder().decode(buffer.bytes({ copy: false }));
   return text.replace(/\s+/g, " ").trim();
+}
+
+async function evaluateCommandRef(id: number, context: Context): Promise<string> {
+  const invoker = context.getCommandRefInvoker(id);
+  if (invoker == null) {
+    throw new ShellEvaluateError(`failed resolving interpolated command with id ${id}`);
+  }
+  let result: CommandRefResult;
+  try {
+    result = await invoker({
+      stderr: context.stderr,
+      signal: context.signal,
+    });
+  } catch (err) {
+    throw new ShellEvaluateError(`failed evaluating interpolated command. ${errorToString(err)}`);
+  }
+  if (result.kind === "failure") {
+    throw new ShellEvaluateError(result.message, result.code);
+  }
+  // normalize whitespace the same way as command substitution
+  return result.text.replace(/\s+/g, " ").trim();
 }
 
 function isDisposable(value: unknown): value is Disposable {

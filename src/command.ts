@@ -58,7 +58,15 @@ import {
   type Writer,
   type WriterSync,
 } from "./pipes.ts";
-import { parseCommand, type ShellOptionsState, spawn } from "./shell.ts";
+import {
+  type CommandRefInvoker,
+  commandRefSentinel,
+  parseCommand,
+  replaceCommandRefSentinels,
+  replaceCommandRefSentinelsInText,
+  type ShellOptionsState,
+  spawn,
+} from "./shell.ts";
 import { StreamFds } from "./shell.ts";
 
 type BufferStdio = "inherit" | "null" | "streamed" | Buffer;
@@ -86,6 +94,9 @@ interface ShellPipeWriterKindWithOptions {
 export interface CommandBuilderStateCommand {
   text: string;
   fds: StreamFds | undefined;
+  /** Command builders interpolated into the template literal, keyed by the
+   * id found in their sentinel within the text. */
+  commandRefs: Map<number, CommandBuilder> | undefined;
 }
 
 interface CommandBuilderState {
@@ -185,6 +196,10 @@ export const getRegisteredCommandNamesSymbol: unique symbol = Symbol();
 /** @internal */
 export const setCommandTextStateSymbol: unique symbol = Symbol();
 
+// module-private accessor to a builder's state, assigned in the
+// class's static block so it can reach the private field
+let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilderState>;
+
 /**
  * Underlying builder API for executing commands.
  *
@@ -206,6 +221,10 @@ export const setCommandTextStateSymbol: unique symbol = Symbol();
  * ```
  */
 export class CommandBuilder implements PromiseLike<CommandResult> {
+  static {
+    getCommandBuilderState = (builder) => builder.#state;
+  }
+
   #state: Readonly<CommandBuilderState> = {
     command: undefined,
     combinedStdoutStderr: false,
@@ -403,6 +422,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       state.command = {
         text: command,
         fds: undefined,
+        commandRefs: undefined,
       };
     });
   }
@@ -1184,7 +1204,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     // label, so the upfront log still runs.
     const tailHidesCommand = state.tailDisplay !== false && state.tailDisplay.header !== false;
     if (!tailHidesCommand) {
-      state.printCommandLogger.getValue()(state.command.text);
+      state.printCommandLogger.getValue()(getDisplayCommandText(state.command));
     }
   }
 
@@ -1226,7 +1246,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   // has registered with the renderer can leave a one-tick window where the
   // pinned region paints without a header.
   const resolvedTailWriterOptions = state.tailDisplay !== false
-    ? resolveTailWriterOptions(state.tailDisplay, state.command.text, Boolean(state.printCommand))
+    ? resolveTailWriterOptions(state.tailDisplay, getDisplayCommandText(state.command), Boolean(state.printCommand))
     : undefined;
   const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
   // ring buffers retaining the trailing N bytes of each captured stream so
@@ -1284,12 +1304,15 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     stderrShellKind,
     stderrErrorRing != null ? wrapWithErrorTailCapture(stderrInner, stderrErrorRing) : stderrInner,
   );
-  const { text: commandText, fds } = state.command;
+  const { text: commandText, fds, commandRefs } = state.command;
   const signal = killSignalController.signal;
 
   return new CommandChild(async (resolve, reject) => {
     try {
       const list = parseCommand(commandText);
+      if (commandRefs != null) {
+        replaceCommandRefSentinels(list);
+      }
       const stdin = await takeStdin();
       let code = await spawn(list, {
         stdin: stdin instanceof ReadableStream ? readerFromStreamReader(stdin.getReader()) : stdin,
@@ -1302,6 +1325,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
         clearedEnv: state.clearEnv,
         signal,
         fds,
+        commandRefs: buildCommandRefInvokers(commandRefs),
         shellOptions: state.shellOptions,
         processTracker: state.processTracker,
       });
@@ -1805,6 +1829,65 @@ function resolveShellKind(
   return userKind;
 }
 
+function buildCommandRefInvokers(
+  commandRefs: ReadonlyMap<number, CommandBuilder> | undefined,
+): Map<number, CommandRefInvoker> | undefined {
+  if (commandRefs == null) {
+    return undefined;
+  }
+  const invokers = new Map<number, CommandRefInvoker>();
+  for (const [id, refBuilder] of commandRefs) {
+    invokers.set(id, async ({ stderr, signal }) => {
+      // use an intermediate controller so killing the evaluating command
+      // kills the interpolated command, but not the other way around
+      const controller = new KillController();
+      const link = signal.linkChild(controller.signal);
+      try {
+        let builder = refBuilder.stdout("piped").signal(controller.signal);
+        if (getCommandBuilderState(refBuilder).stderr.kind === "inherit") {
+          // inherit from the evaluating command instead of the process
+          builder = builder.stderr(writableStreamFromShellPipeWriter(stderr));
+        }
+        const result = await builder;
+        return { kind: "text", text: result.stdout };
+      } catch (err) {
+        const refCommand = getCommandBuilderState(refBuilder).command;
+        const displayText = refCommand == null ? undefined : getDisplayCommandText(refCommand);
+        return {
+          kind: "failure",
+          message: `failed evaluating interpolated command${displayText == null ? "" : ` \`${displayText}\``}. `
+            + errorToString(err),
+          code: err instanceof ShellError ? err.exitCode : 1,
+        };
+      } finally {
+        link.unsubscribe();
+      }
+    });
+  }
+  return invokers;
+}
+
+/** Gets the command text with any command ref sentinels replaced with the
+ * interpolated command's text (ex. for `printCommand` output). */
+function getDisplayCommandText(command: Readonly<CommandBuilderStateCommand>): string {
+  if (command.commandRefs == null) {
+    return command.text;
+  }
+  return replaceCommandRefSentinelsInText(command.text, (id) => {
+    const refBuilder = command.commandRefs?.get(id);
+    const refCommand = refBuilder == null ? undefined : getCommandBuilderState(refBuilder).command;
+    return `$(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
+  });
+}
+
+function writableStreamFromShellPipeWriter(writer: ShellPipeWriter): WritableStream<Uint8Array> {
+  return new WritableStream({
+    async write(chunk) {
+      await writer.writeAll(chunk);
+    },
+  });
+}
+
 /** Wrap a writer with the right sync/async error-context tap based on
  * whether the inner exposes async `write` or sync `writeSync` — mirrors
  * the same dispatch `ShellPipeWriter.write` uses, so the wrapper appears
@@ -2105,6 +2188,7 @@ export type NonRedirectTemplateExpr =
   | Path
   | Uint8Array
   | CommandResult
+  | CommandBuilder
   | RawArg<NonRedirectTemplateExpr>
   | { toString(): string; catch?: never };
 /** Any value that may be interpolated into a `$` template literal command. */
@@ -2133,7 +2217,14 @@ function templateInner(
   let nextStreamFd = 3;
   let text = "";
   let streams: StreamFds | undefined;
+  let commandRefs: Map<number, CommandBuilder> | undefined;
   const exprsCount = exprs.length;
+  const registerCommandRef = (builder: CommandBuilder): string => {
+    commandRefs ??= new Map();
+    const id = commandRefs.size;
+    commandRefs.set(id, builder);
+    return commandRefSentinel(id);
+  };
   for (let i = 0; i < Math.max(strings.length, exprs.length); i++) {
     if (strings.length > i) {
       text += strings[i];
@@ -2147,7 +2238,9 @@ function templateInner(
         const inputOrOutputRedirect = detectInputOrOutputRedirect(text);
         if (inputOrOutputRedirect === "<") {
           if (expr instanceof Path) {
-            text += templateLiteralExprToString(expr, escape);
+            text += templateLiteralExprToString(expr, escape, registerCommandRef);
+          } else if (expr instanceof CommandBuilder) {
+            handleReadableStream(() => expr.stdout("piped").spawn().stdout());
           } else if (typeof expr === "string") {
             handleReadableStream(() =>
               new ReadableStream({
@@ -2209,7 +2302,7 @@ function templateInner(
           }
         } else if (inputOrOutputRedirect === ">") {
           if (expr instanceof Path) {
-            text += templateLiteralExprToString(expr, escape);
+            text += templateLiteralExprToString(expr, escape, registerCommandRef);
           } else if (expr instanceof WritableStream) {
             handleWritableStream(() => expr);
           } else if (expr instanceof Uint8Array) {
@@ -2264,7 +2357,7 @@ function templateInner(
             throw new TypeError("Unsupported object provided to output redirect.");
           }
         } else {
-          text += templateLiteralExprToString(expr, escape);
+          text += templateLiteralExprToString(expr, escape, registerCommandRef);
         }
       } catch (err) {
         const startMessage = exprsCount === 1
@@ -2282,6 +2375,7 @@ function templateInner(
   return {
     text,
     fds: streams,
+    commandRefs,
   };
 
   function handleReadableStream(createStream: () => ReadableStream) {
@@ -2332,22 +2426,25 @@ function detectInputOrOutputRedirect(text: string) {
   }
 }
 
-function templateLiteralExprToString(expr: TemplateExpr, escape: ((arg: string) => string) | undefined): string {
+function templateLiteralExprToString(
+  expr: TemplateExpr,
+  escape: ((arg: string) => string) | undefined,
+  registerCommandRef: (builder: CommandBuilder) => string,
+): string {
   let result: string;
   if (typeof expr === "string") {
     result = expr;
   } else if (expr instanceof Array) {
-    return expr.map((e) => templateLiteralExprToString(e, escape)).join(" ");
+    return expr.map((e) => templateLiteralExprToString(e, escape, registerCommandRef)).join(" ");
   } else if (expr instanceof CommandResult) {
     // remove last newline
     result = expr.stdout.replace(/\r?\n$/, "");
   } else if (expr instanceof CommandBuilder) {
-    throw new TypeError(
-      "Providing a command builder is not yet supported (https://github.com/dsherret/dax/issues/239). "
-        + "Await the command builder's text before using it in an expression (ex. await $`cmd`.text()).",
-    );
+    // substitute a sentinel that the executor lazily resolves to the
+    // command builder's stdout when evaluating the surrounding word
+    return registerCommandRef(expr);
   } else if (expr instanceof RawArg) {
-    return templateLiteralExprToString(expr.value, undefined);
+    return templateLiteralExprToString(expr.value, undefined, registerCommandRef);
   } else if (typeof expr === "object" && expr.toString === Object.prototype.toString) {
     if (expr instanceof Promise) {
       throw new TypeError("Provided object was a Promise. Please await it before providing it.");

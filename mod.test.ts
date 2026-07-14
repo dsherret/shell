@@ -2836,16 +2836,143 @@ Deno.test("should support empty quoted string", async () => {
   assertEquals(output, " test ");
 });
 
-Deno.test("nice error message when not awaiting a CommandBuilder", async () => {
-  await assertRejects(
-    async () => {
-      const cmd = $`echo 1`;
-      return await $`echo ${cmd}`;
-    },
-    Error,
-    "Providing a command builder is not yet supported (https://github.com/dsherret/dax/issues/239). "
-      + "Await the command builder's text before using it in an expression (ex. await $`cmd`.text()).",
-  );
+Deno.test("command builder interpolation - basic", async () => {
+  const cmd = $`echo 1`;
+  assertEquals(await $`echo ${cmd}`.text(), "1");
+});
+
+Deno.test("command builder interpolation - multiple", async () => {
+  const cmd1 = $`echo 1`;
+  const cmd2 = $`echo 2`;
+  const cmd3 = $`echo 3`;
+  assertEquals(await $`echo ${cmd1} ${cmd2} ${cmd3}`.text(), "1 2 3");
+});
+
+Deno.test("command builder interpolation - array", async () => {
+  const cmds = [$`echo 1`, $`echo 2`];
+  assertEquals(await $`echo ${cmds}`.text(), "1 2");
+});
+
+Deno.test("command builder interpolation - inside quotes", async () => {
+  const cmd = $`echo 1`;
+  assertEquals(await $`echo 'example ${cmd} example'`.text(), "example 1 example");
+  assertEquals(await $`echo "example ${cmd} example"`.text(), "example 1 example");
+});
+
+Deno.test("command builder interpolation - adjacent to text", async () => {
+  const cmd = $`echo 1`;
+  assertEquals(await $`echo a${cmd}b`.text(), "a1b");
+});
+
+Deno.test("command builder interpolation - nested", async () => {
+  const inner = $`echo 1`;
+  const middle = $`echo ${inner} 2`;
+  assertEquals(await $`echo ${middle} 3`.text(), "1 2 3");
+});
+
+Deno.test("command builder interpolation - raw template", async () => {
+  const cmd = $`echo 1`;
+  assertEquals(await $.raw`echo ${cmd}`.text(), "1");
+});
+
+Deno.test("command builder interpolation - normalizes whitespace like command substitution", async () => {
+  const cmd = $`cat`.stdinText("1\n2\n");
+  assertEquals(await $`echo ${cmd}`.text(), "1 2");
+  assertEquals(await $`echo 'example ${cmd} example'`.text(), "example 1 2 example");
+});
+
+Deno.test("command builder interpolation - runs once per interpolation site", async () => {
+  let runCount = 0;
+  const cmd = $`echo 1`.beforeCommandSync(() => {
+    runCount++;
+  });
+  assertEquals(await $`echo ${cmd} ${cmd}`.text(), "1 1");
+  assertEquals(runCount, 2);
+});
+
+Deno.test("command builder interpolation - not executed when short-circuited", async () => {
+  let runCount = 0;
+  const cmd = $`echo 1`.beforeCommandSync(() => {
+    runCount++;
+  });
+
+  // the exit command ends the whole list
+  const exitResult = await $`exit 1 && echo ${cmd}`.noThrow();
+  assertEquals(exitResult.code, 1);
+  assertEquals(runCount, 0);
+
+  // && short-circuits on failure
+  const result = await $`test -f non-existent && echo ${cmd}`.noThrow();
+  assertEquals(result.code, 1);
+  assertEquals(runCount, 0);
+
+  // || evaluates the right side on failure
+  assertEquals(await $`test -f non-existent || echo ${cmd}`.text(), "1");
+  assertEquals(runCount, 1);
+});
+
+Deno.test("command builder interpolation - failure fails the outer command", async () => {
+  const cmd = $`exit 5`;
+  const result = await $`echo ${cmd}`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 5);
+  assertStringIncludes(result.stderr, "failed evaluating interpolated command `exit 5`. Exited with code: 5");
+  assertEquals(result.stdout, "");
+});
+
+Deno.test("command builder interpolation - inner noThrow swallows the failure", async () => {
+  const cmd = $`exit 5`.noThrow();
+  assertEquals(await $`echo a${cmd}b`.text(), "ab");
+});
+
+Deno.test("command builder interpolation - stderr goes to the outer command's stderr", async () => {
+  const cmd = $`deno eval -q 'console.error("inner-err"); console.log("out");'`;
+  const result = await $`echo ${cmd}`.stdout("piped").stderr("piped");
+  assertEquals(result.stdout, "out\n");
+  assertEquals(result.stderr, "inner-err\n");
+});
+
+Deno.test("command builder interpolation - explicitly configured stderr is respected", async () => {
+  const cmd = $`deno eval -q 'console.error("inner-err"); console.log("out");'`.stderr("null");
+  const result = await $`echo ${cmd}`.stdout("piped").stderr("piped");
+  assertEquals(result.stdout, "out\n");
+  assertEquals(result.stderr, "");
+});
+
+Deno.test("command builder interpolation - uses its own configuration", async () => {
+  await withTempDir(async (tempDir) => {
+    const cmd = $`pwd`.cwd(tempDir.toString());
+    const expected = await cmd.text();
+    assertEquals(await $`echo ${cmd}`.text(), expected);
+  });
+});
+
+Deno.test("command builder interpolation - env var value", async () => {
+  const cmd = $`echo abc`;
+  assertEquals(await $`VAR=${cmd} printenv VAR`.text(), "abc");
+});
+
+Deno.test("command builder interpolation - input redirect", async () => {
+  const cmd = $`echo 1`;
+  assertEquals(await $`cat < ${cmd}`.text(), "1");
+});
+
+Deno.test("command builder interpolation - killing the outer command kills the inner command", async () => {
+  const cmd = $`sleep 100`;
+  const child = $`echo ${cmd}`.stdout("piped").stderr("piped").spawn();
+  await sleep(200); // give the inner command time to start
+  child.kill();
+  const start = Date.now();
+  await assertRejects(() => child, ShellError, "Aborted");
+  assert(Date.now() - start < 5_000, "should have been killed quickly");
+});
+
+Deno.test("command builder interpolation - printCommand shows the inner command text", async () => {
+  const logs: string[] = [];
+  const inner = $`echo 1`;
+  const outer = $`echo ${inner}`.printCommand();
+  outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
+  assertEquals(await outer.text(), "1");
+  assertEquals(logs, ["echo $(echo 1)"]);
 });
 
 Deno.test("type error null", async () => {

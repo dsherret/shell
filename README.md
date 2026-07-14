@@ -41,6 +41,19 @@ await $.raw`echo one two three`;
 await $`echo ${$.rawArg("1   2   3")}`;
 ```
 
+### Interpolating commands
+
+Interpolating a command substitutes its captured stdout, similar to `$(...)` in a shell:
+
+```ts
+const name = $`echo world`;
+await $`echo hello ${name}`; // hello world
+await $`echo 'hello ${name}'`; // works inside quotes too
+await $`cat < ${name}`; // or as an input redirect
+```
+
+The interpolated command runs lazily when the surrounding command evaluates its arguments, so it never runs when short-circuited away (ex. the interpolated command in `` $`exit 1 && echo ${cmd}` `` doesn't run). It executes with its own configuration (env, cwd, etc.), except stdout is captured and stderr defaults to the evaluating command's stderr. If it fails, the surrounding command fails with its exit code—add `.noThrow()` to the interpolated command to tolerate failure.
+
 ### `build$`
 
 `build$` creates a `$` bound to a specific `CommandBuilder` and/or with extra properties attached.
