@@ -64,8 +64,12 @@ import {
   parseCommand,
   replaceCommandRefSentinels,
   replaceCommandRefSentinelsInText,
+  type SequentialList,
+  ShellEvaluateError,
   type ShellOptionsState,
   spawn,
+  type StreamFdReaderOpts,
+  type StreamFdReaderStderr,
 } from "./shell.ts";
 import { StreamFds } from "./shell.ts";
 
@@ -201,6 +205,10 @@ export const setCommandTextStateSymbol: unique symbol = Symbol();
 let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilderState>;
 // replaces the signal without `.signal()`'s permanent link to the previous one
 let commandBuilderWithSignal: (builder: CommandBuilder, signal: KillSignal) => CommandBuilder;
+// like `.spawn()`, but resolves async `beforeCommand` hooks first instead of
+// throwing when any are registered (the child is wrapped because it's itself
+// a promise and would otherwise be awaited by the caller's `await`)
+let spawnCommandBuilderAsync: (builder: CommandBuilder) => Promise<{ child: CommandChild }>;
 
 /**
  * Underlying builder API for executing commands.
@@ -229,6 +237,9 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       builder.#newWithState((state) => {
         state.signal = signal;
       });
+    spawnCommandBuilderAsync = async (builder) => ({
+      child: parseAndSpawnCommand(await builder.#resolveStateForSpawn()),
+    });
   }
 
   #state: Readonly<CommandBuilderState> = {
@@ -438,6 +449,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       if (command instanceof Array) {
         command = command.map(escapeArg).join(" ");
       }
+      assertNoNullChar(command, "Command text");
       state.command = {
         text: command,
         fds: undefined,
@@ -1328,7 +1340,14 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
 
   return new CommandChild(async (resolve, reject) => {
     try {
-      const list = parseCommand(commandText);
+      let list: SequentialList;
+      try {
+        list = parseCommand(commandText);
+      } catch (err) {
+        // the parser echoes the offending text, so keep the raw sentinels of
+        // any interpolated command out of the message
+        throw replaceCommandRefSentinelsInError(err, commandRefs);
+      }
       if (commandRefs != null) {
         replaceCommandRefSentinels(list);
       }
@@ -1859,21 +1878,13 @@ function buildCommandRefInvokers(
     invokers.set(id, async ({ stderr, signal }) => {
       const linked = linkInterpolatedCommandSignals(refBuilder, signal);
       try {
-        let builder = linked.builder.stdout("piped");
-        if (getCommandBuilderState(refBuilder).stderr.kind === "inherit") {
-          // inherit from the evaluating command instead of the process
-          builder = builder.stderr(writableStreamFromShellPipeWriter(stderr));
-        }
-        const result = await builder;
+        const result = await withInterpolatedCommandOutput(linked.builder, stderr);
         return { kind: "text", text: result.stdout };
       } catch (err) {
-        const refCommand = getCommandBuilderState(refBuilder).command;
-        const displayText = refCommand == null ? undefined : getDisplayCommandText(refCommand);
         return {
           kind: "failure",
-          message: `failed evaluating interpolated command${displayText == null ? "" : ` \`${displayText}\``}. `
-            + errorToString(err),
-          code: err instanceof ShellError ? err.exitCode : 1,
+          message: interpolatedCommandFailureMessage(refBuilder, err),
+          code: interpolatedCommandFailureCode(err),
         };
       } finally {
         linked.unsubscribe();
@@ -1883,13 +1894,120 @@ function buildCommandRefInvokers(
   return invokers;
 }
 
+/** Streams an interpolated command builder's stdout into an input redirect
+ * (ex. `` $`cat < ${$`echo 1`}` ``).
+ *
+ * A failure never surfaces from `read` — the stream just ends — because the
+ * reading command would then be blamed for it with its own exit code.
+ * Instead it's reported when the redirect is disposed, so the interpolated
+ * command's exit code and stderr match the argument position's. It's only
+ * reported when the reading command consumed the output to the end, since
+ * otherwise the command was cut short like the left side of a pipe. */
+function createInterpolatedCommandRedirectReader(
+  refBuilder: CommandBuilder,
+  opts: StreamFdReaderOpts | undefined,
+): Reader & AsyncDisposable {
+  const linked = linkInterpolatedCommandSignals(refBuilder, opts?.signal);
+  // start eagerly so the command still runs when the reading command reads
+  // nothing, but keep the rejection observed so it's never unhandled
+  const started = (async () => {
+    const { child } = await spawnCommandBuilderAsync(withInterpolatedCommandOutput(linked.builder, opts?.stderr));
+    const streamReader = child.stdout().getReader();
+    return { child, streamReader, reader: readerFromStreamReader(streamReader) };
+  })();
+  started.catch(() => {
+    // observed via `read` and dispose below
+  });
+  let reachedEnd = false;
+  let cutShort = false;
+
+  return {
+    async read(p: Uint8Array): Promise<number | null> {
+      if (reachedEnd) {
+        return null;
+      }
+      try {
+        const size = await (await started).reader.read(p);
+        if (size == null) {
+          reachedEnd = true;
+        }
+        return size;
+      } catch {
+        // spawning failed or the command errored mid-stream — end the stream
+        // and let dispose report it
+        reachedEnd = true;
+        return null;
+      }
+    },
+    async [Symbol.asyncDispose]() {
+      try {
+        cutShort = !reachedEnd;
+        if (cutShort) {
+          linked.kill();
+        }
+        let child: CommandChild;
+        try {
+          ({ child } = await started);
+        } catch (err) {
+          // failing to spawn is a configuration error rather than a command
+          // that got cut short, so always report it
+          throw new ShellEvaluateError(
+            interpolatedCommandFailureMessage(refBuilder, err),
+            interpolatedCommandFailureCode(err),
+          );
+        }
+        try {
+          await child;
+        } catch (err) {
+          if (!cutShort) {
+            throw new ShellEvaluateError(
+              interpolatedCommandFailureMessage(refBuilder, err),
+              interpolatedCommandFailureCode(err),
+            );
+          }
+        }
+      } finally {
+        linked.unsubscribe();
+        await started.then(({ streamReader }) => streamReader.cancel(), () => {}).catch(() => {
+          // ignore, the stream may have errored
+        });
+      }
+    },
+  };
+}
+
+/** Captures an interpolated command's stdout and, when it would otherwise go
+ * to the process's stderr, routes its stderr to the evaluating command's. */
+function withInterpolatedCommandOutput(
+  builder: CommandBuilder,
+  stderr: StreamFdReaderStderr | undefined,
+): CommandBuilder {
+  const result = builder.stdout("piped");
+  const stderrKind = getCommandBuilderState(builder).stderr.kind;
+  if (stderr == null || stderrKind !== "inherit" && stderrKind !== "inheritPiped") {
+    return result;
+  }
+  return result.stderr(writableStreamFromShellPipeWriter(stderr));
+}
+
+function interpolatedCommandFailureMessage(refBuilder: CommandBuilder, err: unknown): string {
+  const refCommand = getCommandBuilderState(refBuilder).command;
+  const displayText = refCommand == null ? undefined : getDisplayCommandText(refCommand);
+  return `failed evaluating interpolated command${displayText == null ? "" : ` \`${displayText}\``}. `
+    + errorToString(err);
+}
+
+function interpolatedCommandFailureCode(err: unknown): number {
+  return err instanceof ShellError ? err.exitCode : 1;
+}
+
 /** Gives an interpolated command builder a fresh signal that gets killed by
  * the evaluating command's signal and the builder's own signal (but not the
  * other way around), with the links removable once the invocation finishes. */
 function linkInterpolatedCommandSignals(
   refBuilder: CommandBuilder,
   outerSignal: KillSignal | undefined,
-): { builder: CommandBuilder; unsubscribe(): void } {
+): { builder: CommandBuilder; kill(): void; unsubscribe(): void } {
   const controller = new KillController();
   const links: { unsubscribe(): void }[] = [];
   const ownSignal = getCommandBuilderState(refBuilder).signal;
@@ -1905,6 +2023,9 @@ function linkInterpolatedCommandSignals(
   }
   return {
     builder: commandBuilderWithSignal(refBuilder, controller.signal),
+    kill() {
+      controller.kill();
+    },
     unsubscribe() {
       for (const link of links) {
         link.unsubscribe();
@@ -1916,17 +2037,40 @@ function linkInterpolatedCommandSignals(
 /** Gets the command text with any command ref sentinels replaced with the
  * interpolated command's text (ex. for `printCommand` output). */
 function getDisplayCommandText(command: Readonly<CommandBuilderStateCommand>): string {
-  if (command.commandRefs == null) {
-    return command.text;
+  return getDisplayText(command.text, command.commandRefs);
+}
+
+/** Rewrites the sentinels the parser echoes back in its errors (it's handed
+ * the text before they're resolved), which are otherwise unreadable NULs. */
+function replaceCommandRefSentinelsInError(
+  err: unknown,
+  commandRefs: ReadonlyMap<number, CommandBuilder> | undefined,
+): unknown {
+  if (commandRefs == null) {
+    return err;
   }
-  return replaceCommandRefSentinelsInText(command.text, (id) => {
-    const refBuilder = command.commandRefs?.get(id);
+  // the parser throws strings rather than errors
+  if (typeof err === "string") {
+    return getDisplayText(err, commandRefs);
+  }
+  if (err instanceof Error) {
+    err.message = getDisplayText(err.message, commandRefs);
+  }
+  return err;
+}
+
+function getDisplayText(text: string, commandRefs: ReadonlyMap<number, CommandBuilder> | undefined): string {
+  if (commandRefs == null) {
+    return text;
+  }
+  return replaceCommandRefSentinelsInText(text, (id) => {
+    const refBuilder = commandRefs.get(id);
     const refCommand = refBuilder == null ? undefined : getCommandBuilderState(refBuilder).command;
     return `$(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
   });
 }
 
-function writableStreamFromShellPipeWriter(writer: ShellPipeWriter): WritableStream<Uint8Array> {
+function writableStreamFromShellPipeWriter(writer: StreamFdReaderStderr): WritableStream<Uint8Array> {
   return new WritableStream({
     async write(chunk) {
       await writer.writeAll(chunk);
@@ -2273,6 +2417,7 @@ function templateInner(
   };
   for (let i = 0; i < Math.max(strings.length, exprs.length); i++) {
     if (strings.length > i) {
+      assertNoNullChar(strings[i], "Command text");
       text += strings[i];
     }
     if (exprs.length > i) {
@@ -2463,42 +2608,43 @@ function templateInner(
   function handleCommandBuilderRedirect(builder: CommandBuilder) {
     streams ??= new StreamFds();
     const fd = nextStreamFd++;
-    streams.insertReader(fd, (opts) => {
-      const linked = linkInterpolatedCommandSignals(builder, opts?.signal);
-      let child: CommandChild;
-      try {
-        child = linked.builder.stdout("piped").spawn();
-      } catch (err) {
-        linked.unsubscribe();
-        throw new Error(`Failed spawning interpolated command for input redirect. ${errorToString(err)}`);
-      }
-      const stream = child.stdout();
-      const reader = stream.getReader();
-      return {
-        ...readerFromStreamReader(reader),
-        [Symbol.dispose]() {
-          linked.unsubscribe();
-          reader.releaseLock();
-          // kills the interpolated command when it hasn't finished
-          stream.cancel().catch(() => {
-            // ignore, the stream may have errored
-          });
-        },
-      };
-    });
+    streams.insertReader(fd, (opts) => createInterpolatedCommandRedirectReader(builder, opts));
     text = text.trimEnd() + "&" + fd;
   }
 }
 
+/** Detects a trailing redirect operator that the next expression redirects
+ * to. Quoted operators are literal text rather than a redirect (ex. the `<`
+ * in `` $`echo 'a < ${expr}'` ``), so the quoting is tracked to the end. */
 function detectInputOrOutputRedirect(text: string) {
-  text = text.trimEnd();
-  if (text.endsWith(">")) {
-    return ">";
-  } else if (text.endsWith("<")) {
-    return "<";
-  } else {
-    return undefined;
+  let quoteChar: '"' | "'" | undefined;
+  let redirect: "<" | ">" | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quoteChar === "'") {
+      // a backslash isn't an escape within single quotes
+      if (char === "'") {
+        quoteChar = undefined;
+      }
+      redirect = undefined;
+    } else if (char === "\\") {
+      i++; // skip the escaped character
+      redirect = undefined;
+    } else if (quoteChar === '"') {
+      if (char === '"') {
+        quoteChar = undefined;
+      }
+      redirect = undefined;
+    } else if (char === '"' || char === "'") {
+      quoteChar = char;
+      redirect = undefined;
+    } else if (char === "<" || char === ">") {
+      redirect = char;
+    } else if (!/\s/.test(char)) {
+      redirect = undefined;
+    }
   }
+  return redirect;
 }
 
 function templateLiteralExprToString(
@@ -2530,7 +2676,18 @@ function templateLiteralExprToString(
   } else {
     result = `${expr}`;
   }
+  assertNoNullChar(result, "Provided value");
   return escape ? escape(result) : result;
+}
+
+/** Command ref sentinels are delimited by NUL, so NUL must never reach the
+ * command text from a value, otherwise a value that happened to contain a
+ * sentinel would be resolved as an interpolated command. It's never valid in
+ * a command anyway. */
+function assertNoNullChar(text: string, subject: string): void {
+  if (text.includes("\0")) {
+    throw new TypeError(`${subject} cannot contain the NUL character (\\0).`);
+  }
 }
 
 function writerFromStreamWriter(

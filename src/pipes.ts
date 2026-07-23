@@ -881,6 +881,10 @@ export interface PipedBufferListener extends WriterSync, Closer {
 export class PipedBuffer implements WriterSync {
   #inner: Buffer | PipedBufferListener;
   #hasSet = false;
+  // a command can finish or fail before a listener is attached (ex. one that
+  // fails to parse, whose stream is only acquired after `.spawn()` returns),
+  // so remember the outcome in order to replay it to the listener
+  #pendingOutcome: { kind: "error"; error: Error } | { kind: "close" } | undefined;
 
   constructor() {
     this.#inner = new Buffer();
@@ -897,12 +901,16 @@ export class PipedBuffer implements WriterSync {
   setError(err: Error) {
     if ("setError" in this.#inner) {
       this.#inner.setError(err);
+    } else {
+      this.#pendingOutcome ??= { kind: "error", error: err };
     }
   }
 
   close() {
     if ("close" in this.#inner) {
       this.#inner.close();
+    } else {
+      this.#pendingOutcome ??= { kind: "close" };
     }
   }
 
@@ -921,6 +929,16 @@ export class PipedBuffer implements WriterSync {
 
     this.#inner = listener;
     this.#hasSet = true;
+
+    const outcome = this.#pendingOutcome;
+    if (outcome != null) {
+      this.#pendingOutcome = undefined;
+      if (outcome.kind === "error") {
+        listener.setError(outcome.error);
+      } else {
+        listener.close();
+      }
+    }
   }
 }
 

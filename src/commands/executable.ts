@@ -62,6 +62,12 @@ export function createExecutableCommand(
     }
     const listener = (signal: Signal) => p.kill(signal);
     context.signal.addListener(listener);
+    // the listener only receives future kills, so a signal that was already
+    // aborted by the time the process started would otherwise be missed and
+    // leave the process running
+    if (context.signal.aborted) {
+      p.kill("SIGTERM");
+    }
     const completeController = new AbortController();
     const completeSignal = completeController.signal;
     let stdinError: unknown | undefined;

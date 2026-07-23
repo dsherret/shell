@@ -2938,6 +2938,13 @@ Deno.test("command builder interpolation - explicitly configured stderr is respe
   assertEquals(result.stderr, "");
 });
 
+Deno.test("command builder interpolation - inherited-and-piped stderr goes to the outer command's stderr", async () => {
+  const cmd = $`deno eval -q 'console.error("inner-err"); console.log("out");'`.stderr("inheritPiped");
+  const result = await $`echo ${cmd}`.stdout("piped").stderr("piped");
+  assertEquals(result.stdout, "out\n");
+  assertEquals(result.stderr, "inner-err\n");
+});
+
 Deno.test("command builder interpolation - uses its own configuration", async () => {
   await withTempDir(async (tempDir) => {
     const cmd = $`pwd`.cwd(tempDir.toString());
@@ -2998,6 +3005,19 @@ Deno.test("command builder interpolation - builder without a command errors inst
   assertStringIncludes(result.stderr, "A command must be set");
 });
 
+Deno.test("then's onrejected does not handle a throw from its own onfulfilled", async () => {
+  // matches the Promise spec—`.then(a, b)` never routes a throw from `a` to
+  // `b`, unlike the `.then(a).catch(b)` shape this previously used
+  await assertRejects(
+    () =>
+      $`echo 1`.stdout("null").then(() => {
+        throw new Error("boom");
+      }, () => "recovered") as Promise<unknown>,
+    Error,
+    "boom",
+  );
+});
+
 Deno.test("awaiting a command builder without a command rejects", async () => {
   await assertRejects(
     async () => {
@@ -3016,14 +3036,21 @@ Deno.test("command builder interpolation - builder from a beforeCommand callback
   assertEquals(await $`echo ${captured!}`.text(), "inner");
 });
 
-Deno.test("command builder interpolation - already-aborted outer command doesn't run the inner command", async () => {
-  const inner = $`sleep 100`;
-  const child = $`echo $(sleep 5) ${inner}`.stdout("piped").stderr("piped").spawn();
-  await sleep(200); // let the substitution start
-  const start = Date.now();
-  child.kill();
-  await assertRejects(() => child, ShellError, "Aborted");
-  assert(Date.now() - start < 5_000, "should have been killed quickly");
+Deno.test("command builder interpolation - inner command reached after the outer was killed is killed immediately", async () => {
+  await withTempDir(async (tempDir) => {
+    const markerPath = tempDir.join("marker.txt");
+    // the substitution ahead of it delays the inner command until after the
+    // kill below, so it starts out of an already aborted signal
+    const inner = $`sleep 1 && echo ran > ${markerPath}`;
+    const child = $`echo $(sleep 0.5) ${inner}`.stdout("piped").stderr("piped").spawn();
+    const start = Date.now();
+    child.kill();
+    await assertRejects(() => child, ShellError, "Aborted");
+    assert(Date.now() - start < 5_000, "should have been killed quickly");
+    // give it well past the inner command's sleep to write the marker
+    await sleep(1_500);
+    assertEquals(markerPath.existsSync(), false, "the inner command should not have run to completion");
+  });
 });
 
 Deno.test("command builder interpolation - killing the outer command kills an input redirect command", async () => {
@@ -3054,6 +3081,104 @@ Deno.test("command builder interpolation - printCommand shows the inner command 
   outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
   assertEquals(await outer.text(), "1");
   assertEquals(logs, ["echo $(echo 1)"]);
+});
+
+Deno.test("command builder interpolation - parse errors show the inner command text instead of a sentinel", async () => {
+  const error = await $`echo ~${$`echo 1`}`.then(() => undefined, (err) => err);
+  const text = typeof error === "string" ? error : String(error?.message ?? error);
+  assertStringIncludes(text, "~$(echo 1)");
+  assertEquals(text.includes("\0"), false);
+});
+
+Deno.test("command builder interpolation - values cannot contain a NUL character", () => {
+  // NUL delimits the sentinel that resolves an interpolated command, so a
+  // value containing one must never reach the command text—otherwise a value
+  // shaped like a sentinel would be resolved as an interpolated command
+  assertThrows(
+    () => $`echo ${"a\0b"}`,
+    Error,
+    "Provided value cannot contain the NUL character",
+  );
+  assertThrows(
+    () => $`echo ${$.rawArg("a\0b")}`,
+    Error,
+    "Provided value cannot contain the NUL character",
+  );
+  assertThrows(
+    () => $`echo a\0b`,
+    Error,
+    "Command text cannot contain the NUL character",
+  );
+  assertThrows(
+    () => new CommandBuilder().command("echo a\0b"),
+    TypeError,
+    "Command text cannot contain the NUL character",
+  );
+});
+
+Deno.test("command builder interpolation - quoted redirect operator is not a redirect", async () => {
+  let ranCount = 0;
+  const inner = $`echo hi`.beforeCommandSync((builder) => {
+    ranCount++;
+    return builder;
+  });
+  assertEquals(await $`echo 'x < ${inner} y'`.text(), "x < hi y");
+  assertEquals(await $`echo "x > ${inner} y"`.text(), "x > hi y");
+  assertEquals(ranCount, 2);
+});
+
+Deno.test("command builder interpolation - input redirect failure fails the outer command", async () => {
+  const result = await $`cat < ${$`exit 5`}`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 5);
+  assertStringIncludes(result.stderr, "failed evaluating interpolated command `exit 5`. Exited with code: 5");
+});
+
+Deno.test("command builder interpolation - input redirect status is ignored when not read to the end", async () => {
+  // the reading command never reads, so the interpolated command is cut
+  // short like the left side of a pipe and its status doesn't surface
+  const result = await $`echo hi < ${$`exit 5`}`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout, "hi\n");
+});
+
+Deno.test("command builder interpolation - input redirect stderr goes to the outer command's stderr", async () => {
+  const inner = $`deno eval -q 'console.error("inner-err"); console.log("out");'`;
+  const result = await $`cat < ${inner}`.stdout("piped").stderr("piped");
+  assertEquals(result.stdout, "out\n");
+  assertEquals(result.stderr, "inner-err\n");
+});
+
+Deno.test("command builder interpolation - input redirect respects an explicitly configured stderr", async () => {
+  const inner = $`deno eval -q 'console.error("inner-err"); console.log("out");'`.stderr("null");
+  const result = await $`cat < ${inner}`.stdout("piped").stderr("piped");
+  assertEquals(result.stdout, "out\n");
+  assertEquals(result.stderr, "");
+});
+
+Deno.test("command builder interpolation - input redirect builder without a command errors instead of hanging", async () => {
+  const result = await $`cat < ${new CommandBuilder()}`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 1);
+  assertStringIncludes(result.stderr, "A command must be set");
+});
+
+Deno.test("command builder interpolation - input redirect resolves async beforeCommand hooks", async () => {
+  const inner = $`printenv INNER`.beforeCommand(async (builder) => {
+    await Promise.resolve();
+    return builder.env("INNER", "from-hook");
+  });
+  assertEquals(await $`cat < ${inner}`.text(), "from-hook");
+});
+
+Deno.test("command builder interpolation - input redirect command is killed when the outer command throws", async () => {
+  await withTempDir(async (tempDir) => {
+    const markerPath = tempDir.join("marker.txt");
+    const inner = $`sleep 1 && echo ran > ${markerPath}`;
+    // the tilde fails to expand with no home directory env var set, which
+    // throws out of the outer command after the redirect was resolved
+    await assertRejects(() => $`cat ~ < ${inner}`.clearEnv().noThrow().text());
+    await sleep(1_500);
+    assertEquals(markerPath.existsSync(), false, "the inner command should have been killed");
+  });
 });
 
 Deno.test("type error null", async () => {

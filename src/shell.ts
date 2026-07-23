@@ -20,7 +20,11 @@ import { type ProcessTracker, registerTrackedProcess, type TrackedProcess } from
 import { type EnvChange, type ExecuteResult, getAbortedResult, type ShellOption } from "./result.ts";
 import { stdin as stdinStream } from "./streams.ts";
 
-class ShellEvaluateError extends Error {
+/** Error whose message and exit code become the failing command's, rather
+ * than propagating out of the shell.
+ * @internal
+ */
+export class ShellEvaluateError extends Error {
   readonly code: number;
 
   constructor(message: string, code = 1) {
@@ -322,6 +326,15 @@ export interface StreamFdReaderOpts {
    * factories that spawn work (ex. interpolated command builders) can be
    * killed along with it. */
   signal: KillSignal;
+  /** Stderr of the command the stream is redirected into, so spawned work
+   * writes there instead of to the process's stderr. */
+  stderr: StreamFdReaderStderr;
+}
+
+/** Stderr a stream fd reader writes to. Narrower than `ShellPipeWriter` in
+ * order to keep it out of the public API. */
+export interface StreamFdReaderStderr {
+  writeAll(data: Uint8Array): void | Promise<void>;
 }
 
 export class StreamFds {
@@ -520,7 +533,7 @@ export class Context {
   }
 
   getFdReader(fd: number) {
-    return this.#static.fds?.getReader(fd, { signal: this.#static.signal });
+    return this.#static.fds?.getReader(fd, { signal: this.#static.signal, stderr: this.stderr });
   }
 
   getFdWriter(fd: number) {
@@ -1026,21 +1039,39 @@ async function executeCommand(command: Command, context: Context): Promise<Execu
     } else {
       return redirectResult;
     }
-    const result = await executeCommandInner(command.inner, context);
+    let result: ExecuteResult;
     try {
-      if (isAsyncDisposable(redirectPipe)) {
-        await redirectPipe[Symbol.asyncDispose]();
-      } else if (isDisposable(redirectPipe)) {
-        redirectPipe[Symbol.dispose]();
-      }
+      result = await executeCommandInner(command.inner, context);
+    } catch (err) {
+      // the pipe must still be disposed when the command didn't complete
+      // normally, otherwise anything it owns (ex. an interpolated command's
+      // subprocess) is left running
+      await disposeRedirectPipe(redirectPipe).catch(() => {
+        // ignore, the original error is more useful
+      });
+      throw err;
+    }
+    try {
+      await disposeRedirectPipe(redirectPipe);
     } catch (err) {
       if (result.code === 0) {
+        if (err instanceof ShellEvaluateError) {
+          return context.error(err.code, err.message);
+        }
         return context.error(`failed disposing redirected pipe. ${errorToString(err)}`);
       }
     }
     return result;
   } else {
     return executeCommandInner(command.inner, context);
+  }
+}
+
+async function disposeRedirectPipe(redirectPipe: Reader | PipeWriter) {
+  if (isAsyncDisposable(redirectPipe)) {
+    await redirectPipe[Symbol.asyncDispose]();
+  } else if (isDisposable(redirectPipe)) {
+    redirectPipe[Symbol.dispose]();
   }
 }
 
