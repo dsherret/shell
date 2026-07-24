@@ -3181,6 +3181,36 @@ Deno.test("command builder interpolation - input redirect command is killed when
   });
 });
 
+Deno.test("command builder interpolation - input redirect stdout that can't be streamed doesn't leave the child unobserved", async () => {
+  const unhandled: unknown[] = [];
+  // `process` instead of an "unhandledrejection" event listener because this
+  // file also runs on Node, which has no `globalThis.addEventListener`
+  const listener = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    // captureCombined leaves no separate stdout to stream, so acquiring the
+    // stream fails after the inner command already spawned
+    const result = await $`cat < ${$`exit 5`.captureCombined()}`.noThrow().stdout("piped").stderr("piped");
+    assertEquals(result.code, 1);
+    assertStringIncludes(result.stderr, "failed evaluating interpolated command `exit 5`. No pipe available");
+    await sleep(100);
+    assertEquals(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
+});
+
+Deno.test("command builder interpolation - input redirect stdout that can't be streamed kills the spawned child", async () => {
+  const inner = $`deno eval -q 'await new Promise(resolve => setTimeout(resolve, 30_000));'`.captureCombined();
+  const start = Date.now();
+  const result = await $`cat < ${inner}`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 1);
+  assertStringIncludes(result.stderr, "No pipe available");
+  assert(Date.now() - start < 10_000, "should not have waited for the inner command");
+  // give the killed child a moment so the op sanitizer catches it being left running
+  await sleep(500);
+});
+
 Deno.test("type error null", async () => {
   await assertRejects(
     async () => {

@@ -1912,7 +1912,18 @@ function createInterpolatedCommandRedirectReader(
   // nothing, but keep the rejection observed so it's never unhandled
   const started = (async () => {
     const { child } = await spawnCommandBuilderAsync(withInterpolatedCommandOutput(linked.builder, opts?.stderr));
-    const streamReader = child.stdout().getReader();
+    let streamReader: ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      streamReader = child.stdout().getReader();
+    } catch (err) {
+      // the child spawned, but its output can't be read, so it's of no use to
+      // anyone — kill it and observe it here because nothing else will
+      child.catch(() => {
+        // observe and ignore
+      });
+      linked.kill();
+      throw err;
+    }
     return { child, streamReader, reader: readerFromStreamReader(streamReader) };
   })();
   started.catch(() => {
