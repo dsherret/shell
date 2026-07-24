@@ -620,7 +620,10 @@ export class Context {
       stderr: this.stderr,
       env: this.#env.clone(),
       shellVars: { ...this.#shellVars },
-      shellOptions: this.#shellOptions,
+      // copy so option changes (ex. `set -e`) in the clone don't mutate the
+      // parent's options by reference; option changes still propagate to the
+      // parent through the returned `changes` where that is intended
+      shellOptions: { ...this.#shellOptions },
       static: this.#static,
     });
   }
@@ -1261,10 +1264,27 @@ function executeCommandInner(command: CommandInner, context: Context): Promise<E
 async function executeSimpleCommand(command: SimpleCommand, parentContext: Context) {
   const context = parentContext.clone();
   try {
+    // apply the prefix assignments to the clone so that later assignments and
+    // the args can reference earlier ones (ex. `FOO=1 BAR=$FOO $(true)`), while
+    // capturing the evaluated pairs in case the command word expands to nothing
+    const assignments: { name: string; value: string }[] = [];
     for (const envVar of command.envVars) {
-      context.setEnvVar(envVar.name, await evaluateWord(envVar.value, context));
+      const value = await evaluateWord(envVar.value, context);
+      context.setEnvVar(envVar.name, value);
+      assignments.push({ name: envVar.name, value });
     }
     const commandArgs = await evaluateArgs(command.args, context);
+    if (commandArgs.length === 0) {
+      // the command word expanded to nothing (ex. `FOO=1 $(true)`), so per POSIX
+      // the assignments affect the current execution environment exactly as a
+      // bare `FOO=1` would. they become shell variables (not exported), matching
+      // bash. (note: bash would also adopt the exit status of the last command
+      // substitution here, but dax discards that separately and returns 0.)
+      return {
+        code: 0,
+        changes: assignments.map(({ name, value }) => ({ kind: "shellvar" as const, name, value })),
+      };
+    }
     return await executeCommandArgs(commandArgs, context);
   } catch (err) {
     if (err instanceof ShellEvaluateError) {
@@ -1314,7 +1334,10 @@ async function executeUnresolvedCommand(
 }
 
 async function executeSubshell(subshell: Subshell, context: Context): Promise<ExecuteResult> {
-  const result = await executeSequentialList(subshell, context);
+  // run the body in an isolated clone so env, cwd, shell variable, and shell
+  // option changes made inside the subshell are visible within it but do not
+  // leak to the enclosing shell (POSIX subshell semantics)
+  const result = await executeSequentialList(subshell, context.clone());
   // sub shells do not change the environment or cause an exit
   return { code: result.code };
 }

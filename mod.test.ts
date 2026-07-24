@@ -382,15 +382,41 @@ Deno.test("command substitution: a no-op command's exit status within a list", a
   assertEquals((await $`exit 5; $(true)`.noThrow().stderr("piped")).code, 5);
 });
 
-Deno.test("command substitution: an env var prefix on a no-op command is discarded (diverges from bash)", async () => {
-  // Arguably a bug. Bash keeps `FOO=1` in the current shell when the command word
-  // expands to nothing, but dax applies the assignment to a cloned context that the
-  // no-op returns from without reporting any env changes, so it's dropped. This test
-  // records the current behaviour rather than endorsing it: if dax is ever made
-  // POSIX-correct here, update the assertion below to `"[1]\n"`.
+Deno.test("command substitution: an env var prefix on a no-op command persists to the current shell", async () => {
+  // POSIX-correct: when the command word expands to nothing, the variable
+  // assignments affect the current execution environment exactly as a bare
+  // `FOO=1` would, so bash prints `[1]` here and dax now matches.
   const result = await $`FOO=1 $(true) && echo "[$FOO]"`.noThrow().stdout("piped").stderr("piped");
   assertEquals(result.code, 0);
-  assertEquals(result.stdout, "[]\n");
+  assertEquals(result.stdout, "[1]\n");
+  assertEquals(result.stderr, "");
+});
+
+Deno.test("command substitution: chained env var prefixes on a no-op command reference each other and persist", async () => {
+  // `BAR=$FOO` must see the earlier `FOO=1`, and both persist to the current
+  // shell (bash prints `[1][1]`).
+  const result = await $`FOO=1 BAR=$FOO $(true); echo "[$FOO][$BAR]"`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout, "[1][1]\n");
+  assertEquals(result.stderr, "");
+});
+
+Deno.test("command substitution: a no-op env var prefix becomes a shell var, not an exported env var", async () => {
+  // like a bare assignment in bash, the value is a shell variable that is not
+  // exported, so `printenv` (which only sees env vars) does not find it and prints
+  // a blank line, yet the variable is still readable via expansion in the current shell.
+  const result = await $`FOO=1 $(true); printenv FOO; echo "[$FOO]"`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout, "\n[1]\n");
+});
+
+Deno.test("command substitution: an env var prefix on a real command does not persist to the parent", async () => {
+  // scope boundary: a prefix assignment on a command with a real command word is
+  // exported only to that command's environment, not the parent shell (bash prints
+  // `1` then `[]`).
+  const result = await $`FOO=1 printenv FOO; echo "[$FOO]"`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout, "1\n[]\n");
   assertEquals(result.stderr, "");
 });
 
@@ -1851,6 +1877,41 @@ Deno.test("subshells", async () => {
     const result = await $`(cd subDir && pwd) && pwd`.cwd(tempDir).text();
     assertEquals(result, `${subDir}\n${tempDir}`);
   });
+});
+
+Deno.test("subshells: changes are visible within but do not leak to the parent (sequential path)", async () => {
+  // these all reach the subshell through the sequential (`;`/top-level) path,
+  // where the body runs in the parent context historically and leaked; bash
+  // isolates every one of them.
+
+  // a no-op env var prefix: visible inside, gone outside (bash: `in[1]` then `out[]`)
+  {
+    const result = await $`( FOO=1 $(true); echo "in[$FOO]" ); echo "out[$FOO]"`.noThrow().stdout("piped").text();
+    assertEquals(result, "in[1]\nout[]");
+  }
+  // a bare shell var assignment does not overwrite the parent's (bash: `[1]`)
+  {
+    const result = await $`X=1; ( X=9 ); echo "[$X]"`.noThrow().stdout("piped").text();
+    assertEquals(result, "[1]");
+  }
+  // an export does not leak (bash: `[]`)
+  {
+    const result = await $`( export FOO=1 ); echo "[$FOO]"`.noThrow().stdout("piped").text();
+    assertEquals(result, "[]");
+  }
+  // a cd does not move the parent's cwd
+  await withTempDir(async (tempDir) => {
+    const subDir = tempDir.join("subDir");
+    subDir.mkdirSync();
+    const result = await $`( cd subDir ) && pwd`.cwd(tempDir).text();
+    assertEquals(result, `${tempDir}`);
+  });
+  // a shell option change (`set -e`) does not leak: the subsequent `false`
+  // must not abort the parent list, so `reached` still prints
+  {
+    const result = await $`set +e; ( set -e ); false; echo reached`.noThrow().stdout("piped").text();
+    assertEquals(result, "reached");
+  }
 });
 
 Deno.test("output redirects", async () => {
