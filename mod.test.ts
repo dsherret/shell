@@ -341,6 +341,59 @@ Deno.test("command substitution: env changes inside it do not leak to the parent
   assertEquals(result, "inner:outer");
 });
 
+Deno.test("command substitution: expanding to nothing as the whole command is a no-op", async () => {
+  // like other shells, a command word that expands to nothing does nothing and succeeds
+  await assertNoOp($`$(true)`);
+  // whitespace-only output collapses to empty, so these are no-ops too
+  await assertNoOp($`$(echo)`);
+  await assertNoOp($`$(echo "   ")`);
+
+  // ...but a word after it becomes the command name
+  const withArg = await $`$(true) nonexistentcommanddaxtest`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(withArg.code, 127);
+  assertEquals(withArg.stdout, "");
+  assertEquals(withArg.stderr, "dax: nonexistentcommanddaxtest: command not found\n");
+
+  async function assertNoOp(command: CommandBuilder) {
+    const result = await command.noThrow().stdout("piped").stderr("piped");
+    assertEquals(result.code, 0);
+    assertEquals(result.stdout, "");
+    assertEquals(result.stderr, "");
+  }
+});
+
+Deno.test("command substitution: a no-op command's exit status within a list", async () => {
+  // the no-op reports success, resetting an earlier failure like bash does
+  const afterSemicolon = await $`false; $(true)`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(afterSemicolon.code, 0);
+  assertEquals(afterSemicolon.stdout, "");
+  assertEquals(afterSemicolon.stderr, "");
+  const afterOr = await $`false || $(true)`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(afterOr.code, 0);
+  assertEquals(afterOr.stdout, "");
+  assertEquals(afterOr.stderr, "");
+
+  // the two cases below never reach the no-op at all, so they pin nothing about it
+  // today and only guard against a future change routing them through it
+
+  // `&&` short circuits, so the failure stands
+  assertEquals((await $`false && $(true)`.noThrow().stderr("piped")).code, 1);
+  // `exit` ends the list first
+  assertEquals((await $`exit 5; $(true)`.noThrow().stderr("piped")).code, 5);
+});
+
+Deno.test("command substitution: an env var prefix on a no-op command is discarded (diverges from bash)", async () => {
+  // Arguably a bug. Bash keeps `FOO=1` in the current shell when the command word
+  // expands to nothing, but dax applies the assignment to a cloned context that the
+  // no-op returns from without reporting any env changes, so it's dropped. This test
+  // records the current behaviour rather than endorsing it: if dax is ever made
+  // POSIX-correct here, update the assertion below to `"[1]\n"`.
+  const result = await $`FOO=1 $(true) && echo "[$FOO]"`.noThrow().stdout("piped").stderr("piped");
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout, "[]\n");
+  assertEquals(result.stderr, "");
+});
+
 Deno.test("should not get stdout when set to writer", async () => {
   const buffer = new Buffer();
   const output = await $`echo 5`.stdout(buffer);
@@ -620,6 +673,29 @@ Deno.test("quoted multiple variables with spaces", async () => {
     other: "three four",
   }).text();
   assertEquals(output, "one two three four");
+});
+
+Deno.test("unquoted empty variable as the whole command is a no-op", async () => {
+  // an unset variable expands to nothing, leaving no command word to run
+  // (the leading `unset` keeps this independent of the ambient environment)
+  const unset = await $`unset DAX_EMPTY_VAR_TEST && $DAX_EMPTY_VAR_TEST`
+    .noThrow().stdout("piped").stderr("piped");
+  assertEquals(unset.code, 0);
+  assertEquals(unset.stdout, "");
+  assertEquals(unset.stderr, "");
+  // ...as does one explicitly set to an empty value
+  const empty = await $`export DAX_EMPTY_VAR_TEST= && $DAX_EMPTY_VAR_TEST`
+    .noThrow().stdout("piped").stderr("piped");
+  assertEquals(empty.code, 0);
+  assertEquals(empty.stdout, "");
+  assertEquals(empty.stderr, "");
+
+  // quoting instead keeps an empty command name, which isn't found (same as bash)
+  const quoted = await $`unset DAX_EMPTY_VAR_TEST && "$DAX_EMPTY_VAR_TEST"`
+    .noThrow().stdout("piped").stderr("piped");
+  assertEquals(quoted.code, 127);
+  assertEquals(quoted.stdout, "");
+  assertEquals(quoted.stderr, "dax: : command not found\n");
 });
 
 Deno.test("stdoutJson", async () => {
