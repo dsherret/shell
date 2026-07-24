@@ -2420,6 +2420,7 @@ function templateInner(
   let streams: StreamFds | undefined;
   let commandRefs: Map<number, CommandBuilder> | undefined;
   const exprsCount = exprs.length;
+  const redirectScanner = createRedirectScanner();
   const registerCommandRef = (builder: CommandBuilder): string => {
     commandRefs ??= new Map();
     const id = commandRefs.size;
@@ -2437,7 +2438,7 @@ function templateInner(
         if (expr == null) {
           throw "Expression was null or undefined.";
         }
-        const inputOrOutputRedirect = detectInputOrOutputRedirect(text);
+        const inputOrOutputRedirect = redirectScanner.scan(text);
         if (inputOrOutputRedirect === "<") {
           if (expr instanceof Path) {
             text += templateLiteralExprToString(expr, escape, registerCommandRef);
@@ -2592,7 +2593,7 @@ function templateInner(
         },
       };
     });
-    text = text.trimEnd() + "&" + fd;
+    appendStreamFd(fd);
   }
 
   function handleWritableStream(createStream: () => WritableStream) {
@@ -2613,49 +2614,104 @@ function templateInner(
         },
       };
     });
-    text = text.trimEnd() + "&" + fd;
+    appendStreamFd(fd);
   }
 
   function handleCommandBuilderRedirect(builder: CommandBuilder) {
     streams ??= new StreamFds();
     const fd = nextStreamFd++;
     streams.insertReader(fd, (opts) => createInterpolatedCommandRedirectReader(builder, opts));
+    appendStreamFd(fd);
+  }
+
+  /** Makes the pending redirect operator target the stream's fd
+   * (ex. `cat < ` becomes `cat <&3`). */
+  function appendStreamFd(fd: number) {
     text = text.trimEnd() + "&" + fd;
+    redirectScanner.resyncAfterRedirect(text);
   }
 }
 
-/** Detects a trailing redirect operator that the next expression redirects
- * to. Quoted operators are literal text rather than a redirect (ex. the `<`
- * in `` $`echo 'a < ${expr}'` ``), so the quoting is tracked to the end. */
-function detectInputOrOutputRedirect(text: string) {
+/** Creates a scanner that detects a trailing redirect operator that the next
+ * expression redirects to. Quoted operators are literal text rather than a
+ * redirect (ex. the `<` in `` $`echo 'a < ${expr}'` ``), so the quoting is
+ * tracked to the end.
+ *
+ * Scanning is incremental because the text grows with every expression and
+ * an expression may be megabytes large—rescanning from the start each time
+ * would make building a command quadratic.
+ */
+export function createRedirectScanner(): {
+  scan(text: string): "<" | ">" | undefined;
+  resyncAfterRedirect(text: string): void;
+} {
   let quoteChar: '"' | "'" | undefined;
+  let escaped = false;
   let redirect: "<" | ">" | undefined;
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    if (quoteChar === "'") {
-      // a backslash isn't an escape within single quotes
-      if (char === "'") {
-        quoteChar = undefined;
+  let scannedLength = 0;
+  return {
+    /** Scans whatever text was appended since the previous call and returns
+     * the redirect operator that an expression substituted here would
+     * redirect to. */
+    scan(text: string): "<" | ">" | undefined {
+      for (let i = scannedLength; i < text.length; i++) {
+        const char = text[i];
+        if (quoteChar === "'") {
+          // a backslash isn't an escape within single quotes
+          if (char === "'") {
+            quoteChar = undefined;
+          }
+          redirect = undefined;
+        } else if (escaped) {
+          escaped = false; // the escaped character is literal text
+          redirect = undefined;
+        } else if (char === "\\") {
+          escaped = true;
+          redirect = undefined;
+        } else if (quoteChar === '"') {
+          if (char === '"') {
+            quoteChar = undefined;
+          }
+          redirect = undefined;
+        } else if (char === '"' || char === "'") {
+          quoteChar = char;
+          redirect = undefined;
+        } else if (char === "<" || char === ">") {
+          redirect = char;
+        } else if (!isWhitespace(char)) {
+          redirect = undefined;
+        }
       }
+      scannedLength = text.length;
+      return redirect;
+    },
+    /** Resyncs after the pending redirect's trailing whitespace was replaced
+     * with a stream's fd (ex. `cat < ` becomes `cat <&3`).
+     *
+     * Only call this with the text of a redirect that {@link scan} just
+     * returned—the text may now be shorter than what was scanned, so resuming
+     * from its end is only correct because everything up to the operator was
+     * already scanned.
+     *
+     * None of the rewrite can affect the quoting: a redirect is only pending
+     * outside of quotes with no escape pending, only whitespace is removed,
+     * and the appended `&<fd>` is plain text that satisfies the redirect. */
+    resyncAfterRedirect(text: string) {
       redirect = undefined;
-    } else if (char === "\\") {
-      i++; // skip the escaped character
-      redirect = undefined;
-    } else if (quoteChar === '"') {
-      if (char === '"') {
-        quoteChar = undefined;
-      }
-      redirect = undefined;
-    } else if (char === '"' || char === "'") {
-      quoteChar = char;
-      redirect = undefined;
-    } else if (char === "<" || char === ">") {
-      redirect = char;
-    } else if (!/\s/.test(char)) {
-      redirect = undefined;
-    }
+      scannedLength = text.length;
+    },
+  };
+}
+
+/** Equivalent to `/\s/`, but avoids the regex for the ascii characters that
+ * make up nearly all command text. */
+function isWhitespace(char: string) {
+  const code = char.charCodeAt(0);
+  if (code < 0x80) {
+    // space, tab, line feed, vertical tab, form feed and carriage return
+    return code === 0x20 || (code >= 0x09 && code <= 0x0d);
   }
-  return redirect;
+  return /\s/.test(char);
 }
 
 function templateLiteralExprToString(

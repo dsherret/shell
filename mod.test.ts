@@ -21,7 +21,16 @@ import {
   type TrackedProcess,
   whichRealEnv,
 } from "./mod.ts";
-import { $, ensurePromiseNotResolved, getStdErr, mk$, sleep, usingTempDir, withTempDir } from "./src/test/helpers.ts";
+import {
+  $,
+  buildCommandText,
+  ensurePromiseNotResolved,
+  getStdErr,
+  mk$,
+  sleep,
+  usingTempDir,
+  withTempDir,
+} from "./src/test/helpers.ts";
 
 Deno.test("should get stdout when piped", async () => {
   const output = await $`echo 5`.stdout("piped");
@@ -3125,6 +3134,85 @@ Deno.test("command builder interpolation - quoted redirect operator is not a red
   assertEquals(await $`echo 'x < ${inner} y'`.text(), "x < hi y");
   assertEquals(await $`echo "x > ${inner} y"`.text(), "x > hi y");
   assertEquals(ranCount, 2);
+});
+
+Deno.test("command builder interpolation - detects an unquoted trailing redirect operator", async () => {
+  // a string is never valid in an output redirect, so the error is the
+  // cheapest way to observe that the trailing `>` was seen as a redirect
+  const outputRedirectError = "Cannot provide strings to output redirects";
+  assertThrows(() => $`echo 1 > ${"file"}`, TypeError, outputRedirectError);
+  assertThrows(() => $`echo 1 >${"file"}`, TypeError, outputRedirectError);
+  assertThrows(() => $`echo 1 >> ${"file"}`, TypeError, outputRedirectError);
+  assertThrows(() => $`echo 1 2> ${"file"}`, TypeError, outputRedirectError);
+  // a quote that opens and closes leaves the following operator unquoted
+  assertThrows(() => $`echo '' > ${"file"}`, TypeError, outputRedirectError);
+  // a string in an input redirect becomes the command's stdin
+  assertEquals(await $`cat < ${"hi"}`.text(), "hi");
+  assertEquals(await $`cat <${"hi"}`.text(), "hi");
+  assertEquals(await $`echo '' < ${"hi"}`.text(), "");
+  // any whitespace may separate the operator from the expression, including
+  // the newline of a multi-line command and non-ascii whitespace
+  assertEquals(
+    await $`cat <
+      ${"hi"}`.text(),
+    "hi",
+  );
+  assertEquals(await $`cat <\t\v\f\r ${"hi"}`.text(), "hi");
+  assertEquals(await $`cat <\u00a0${"hi"}`.text(), "hi");
+  // an expression that isn't preceded by an operator is an argument
+  assertEquals(await $`echo "a" ${"b"}`.text(), "a b");
+});
+
+Deno.test("command builder interpolation - quoted or escaped redirect operator is not a redirect", async () => {
+  assertEquals(await $`echo 'a < ${"b"}'`.text(), "a < b");
+  assertEquals(await $`echo 'a <${"b"}'`.text(), "a <b");
+  assertEquals(await $`echo "a > ${"b"}"`.text(), "a > b");
+  // a backslash escapes the operator outside of quotes
+  assertEquals(buildCommandText`echo \\< ${"b"}`, "echo \\< b");
+  assertEquals(buildCommandText`echo 1 \\> ${"file"}`, "echo 1 \\> file");
+  // ...even when the operator arrives in a later expression than its backslash
+  assertEquals(buildCommandText`echo \\${$.rawArg("<")} ${"b"}`, "echo \\< b");
+  // ...and within double quotes, where it must not end the quoting early
+  assertEquals(await $`echo "a \\" > ${"b"}"`.text(), 'a " > b');
+  // ...but not within single quotes, where the quoting ends at the next `'`
+  assertThrows(
+    () => $`echo 'a\\' > ${"file"}`,
+    TypeError,
+    "Cannot provide strings to output redirects",
+  );
+});
+
+Deno.test("command builder interpolation - redirect detection survives previous expressions", async () => {
+  // an escaped argument's quoting is balanced, so a later operator is still
+  // detected (`it's` escapes to `'it'"'"'s'`)
+  assertThrows(
+    () => $`echo ${"it's"} > ${"file"}`,
+    TypeError,
+    "Cannot provide strings to output redirects",
+  );
+  assertEquals(await $`echo ${"it's"} < ${"hi"}`.text(), "it's");
+  // a redirect is rewritten to the stream's fd (ex. `cat <&3`), which the
+  // next expression must not see as part of that redirect
+  assertEquals(buildCommandText`echo x < ${"a"} ${"y"}`, "echo x <&3 y");
+  assertEquals(buildCommandText`cat < ${"a"} < ${"b"}`, "cat <&3 <&4");
+});
+
+Deno.test("command builder interpolation - building a command with many large expressions is linear", () => {
+  // the text accumulated so far used to be rescanned for a trailing redirect
+  // operator once per expression, which made building a command quadratic in
+  // its total size. This is a smoke test against that implementation, which
+  // takes over 20x longer here: the budget is loose enough for a slow machine
+  // and so won't notice a smaller regression. `src/command.test.ts` is what
+  // actually pins the scanning to the newly appended text.
+  const exprCount = 40;
+  const big = "a".repeat(500_000);
+  const parts = ["echo ", ...Array.from({ length: exprCount }, () => " ")];
+  const strings: TemplateStringsArray = Object.assign(parts, { raw: parts });
+  const exprs = Array.from({ length: exprCount }, () => big);
+  const start = performance.now();
+  $(strings, ...exprs);
+  const duration = performance.now() - start;
+  assert(duration < 2_500, `Took too long to build the command (${duration.toFixed(0)}ms).`);
 });
 
 Deno.test("command builder interpolation - input redirect failure fails the outer command", async () => {

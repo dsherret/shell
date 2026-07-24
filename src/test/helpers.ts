@@ -34,6 +34,14 @@ export function mk$(commandBuilder: CommandBuilder = new CommandBuilder()): Test
 export const $: Test$ = mk$();
 
 /**
+ * Builds a command's text without running it, which is how substitutions
+ * that the shell itself refuses to parse are checked.
+ */
+export function buildCommandText(strings: TemplateStringsArray, ...exprs: TemplateExpr[]): string {
+  return template(strings, exprs).text;
+}
+
+/**
  * Creates a temporary directory, chdirs into it, runs the action, then
  * restores cwd and deletes the directory.
  */
