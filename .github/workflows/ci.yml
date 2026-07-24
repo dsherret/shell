@@ -62,6 +62,4 @@ jobs:
         with:
           deno-version: 2.x
       - name: Publish to JSR on tag
-        # --no-lock so resolving this ephemeral tool doesn't add it to the
-        # project's deno.lock, which would dirty the tree and abort the publish
-        run: deno run --no-lock -A jsr:@david/publish-on-tag@0.2.0
+        run: deno run -A jsr:@david/publish-on-tag@0.2.0
