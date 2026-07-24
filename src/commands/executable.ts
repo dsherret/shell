@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { getAbortedSignal } from "../command.ts";
 import type { CommandContext, CommandHandler, CommandPipeReader, CommandPipeWriter } from "../commandHandler.ts";
 import { errorToString } from "../common.ts";
 import {
@@ -64,9 +65,10 @@ export function createExecutableCommand(
     context.signal.addListener(listener);
     // the listener only receives future kills, so a signal that was already
     // aborted by the time the process started would otherwise be missed and
-    // leave the process running
+    // leave the process running. replay its original signal rather than
+    // defaulting to SIGTERM so the process sees the actual signal
     if (context.signal.aborted) {
-      p.kill("SIGTERM");
+      p.kill(getAbortedSignal(context.signal));
     }
     const completeController = new AbortController();
     const completeSignal = completeController.signal;

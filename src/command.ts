@@ -202,13 +202,26 @@ export const setCommandTextStateSymbol: unique symbol = Symbol();
 
 // module-private accessors assigned in the class's static block so they
 // can reach the private members
-let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilderState>;
+/** @internal */
+export let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilderState>;
 // replaces the signal without `.signal()`'s permanent link to the previous one
 let commandBuilderWithSignal: (builder: CommandBuilder, signal: KillSignal) => CommandBuilder;
 // like `.spawn()`, but resolves async `beforeCommand` hooks first instead of
 // throwing when any are registered (the child is wrapped because it's itself
 // a promise and would otherwise be awaited by the caller's `await`)
 let spawnCommandBuilderAsync: (builder: CommandBuilder) => Promise<{ child: CommandChild }>;
+// reads back the signal that caused an abort from the private state, assigned
+// in KillSignal's static block so it can reach the private member
+let getAbortedSignalOf: (signal: KillSignal) => Signal | undefined;
+
+/** Gets the signal that caused a `KillSignal`'s abort, or `undefined` if it
+ * is not aborted.
+ *
+ * @internal
+ */
+export function getAbortedSignal(signal: KillSignal): Signal | undefined {
+  return getAbortedSignalOf(signal);
+}
 
 /**
  * Underlying builder API for executing commands.
@@ -1250,9 +1263,10 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     };
     parentSignal.addListener(parentSignalListener);
     // if the parent was already aborted before the listener was added,
-    // propagate immediately since sendSignalToState already ran
+    // propagate immediately since sendSignalToState already ran, replaying its
+    // original signal so the specific abort exit code is preserved
     if (parentSignal.aborted) {
-      killSignalController.kill("SIGTERM");
+      killSignalController.kill(getAbortedSignal(parentSignal));
     }
     disposables.push({
       [Symbol.dispose]() {
@@ -2013,8 +2027,11 @@ function interpolatedCommandFailureCode(err: unknown): number {
 
 /** Gives an interpolated command builder a fresh signal that gets killed by
  * the evaluating command's signal and the builder's own signal (but not the
- * other way around), with the links removable once the invocation finishes. */
-function linkInterpolatedCommandSignals(
+ * other way around), with the links removable once the invocation finishes.
+ *
+ * @internal
+ */
+export function linkInterpolatedCommandSignals(
   refBuilder: CommandBuilder,
   outerSignal: KillSignal | undefined,
 ): { builder: CommandBuilder; kill(): void; unsubscribe(): void } {
@@ -2027,9 +2044,13 @@ function linkInterpolatedCommandSignals(
   if (ownSignal != null) {
     links.push(ownSignal.linkChild(controller.signal));
   }
-  // linkChild only forwards future kills, so propagate an existing abort
-  if (outerSignal?.aborted || ownSignal?.aborted) {
-    controller.kill();
+  // linkChild only forwards future kills, so replay an already-aborted signal
+  // with its original signal to preserve the specific abort exit code. When
+  // both are aborted the outer (evaluating command's) signal wins.
+  const abortedSignal = (outerSignal != null ? getAbortedSignal(outerSignal) : undefined)
+    ?? (ownSignal != null ? getAbortedSignal(ownSignal) : undefined);
+  if (abortedSignal != null) {
+    controller.kill(abortedSignal);
   }
   return {
     builder: commandBuilderWithSignal(refBuilder, controller.signal),
@@ -2223,6 +2244,9 @@ const SHELL_SIGNAL_CTOR_SYMBOL = Symbol();
 
 interface KillSignalState {
   abortedCode: number | undefined;
+  // the signal that caused the abort, retained so a later catch-up can replay
+  // the exact signal rather than defaulting to SIGTERM and losing the code
+  abortedSignal: Signal | undefined;
   listeners: ((signal: Signal) => void)[];
 }
 
@@ -2234,6 +2258,7 @@ export class KillController {
   constructor() {
     this.#state = {
       abortedCode: undefined,
+      abortedSignal: undefined,
       listeners: [],
     };
     this.#killSignal = new KillSignal(SHELL_SIGNAL_CTOR_SYMBOL, this.#state);
@@ -2265,6 +2290,10 @@ export type KillSignalListener = (signal: Signal) => void;
  * These can be created via a `KillController`.
  */
 export class KillSignal {
+  static {
+    getAbortedSignalOf = (signal) => signal.#state.abortedSignal;
+  }
+
   #state: KillSignalState;
 
   /** @internal */
@@ -2334,6 +2363,7 @@ function sendSignalToState(state: KillSignalState, signal: Signal) {
   const code = getSignalAbortCode(signal);
   if (code !== undefined) {
     state.abortedCode = code;
+    state.abortedSignal = signal;
   }
   // copy in case a listener adds/removes listeners while being invoked
   for (const listener of [...state.listeners]) {
