@@ -3125,6 +3125,33 @@ Deno.test("command builder interpolation - values cannot contain a NUL character
   );
 });
 
+Deno.test("command builder interpolation - command text cannot have an invalid escape sequence", async () => {
+  // an invalid escape sequence leaves that part of the cooked template
+  // undefined, which otherwise fails with an internal error that points at the
+  // NUL check rather than at the backslash the user wrote
+  const message = (rawSegment: string) =>
+    `Command text contains an invalid JavaScript escape sequence in \`${rawSegment}\`. `
+    + "Escape each backslash in it to use them literally (ex. `\\\\unicode`), or "
+    + "interpolate the value instead (ex. a path via the `$.path(...)` API).";
+  assertThrows(() => $`echo \unicode ${1}`, TypeError, message("echo \\unicode "));
+  assertThrows(() => $`echo \unicode`, TypeError, message("echo \\unicode"));
+  assertThrows(() => $.raw`echo \unicode`, TypeError, message("echo \\unicode"));
+  // the error quotes the offending segment, not the whole command
+  assertThrows(() => $`echo ${1} \unicode`, TypeError, message(" \\unicode"));
+  // a Windows path is the common trigger: only `\u` and `\x` fail to cook here,
+  // but the whole segment is quoted because escaping just those two leaves the
+  // others (ex. `\t`) silently cooking to something else
+  assertThrows(
+    () => $`cp C:\temp\users\x\file.txt D:\out`,
+    TypeError,
+    message("cp C:\\temp\\users\\x\\file.txt D:\\out"),
+  );
+  // the shell emits a literal backslash for the escaped backslash the error
+  // suggests, so the advice actually resolves to what the user wrote
+  assertEquals(buildCommandText`echo \\unicode`, "echo \\unicode");
+  assertEquals(await $`echo \\unicode`.text(), "\\unicode");
+});
+
 Deno.test("command builder interpolation - quoted redirect operator is not a redirect", async () => {
   let ranCount = 0;
   const inner = $`echo hi`.beforeCommandSync((builder) => {

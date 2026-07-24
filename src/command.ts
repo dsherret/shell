@@ -2429,8 +2429,23 @@ function templateInner(
   };
   for (let i = 0; i < Math.max(strings.length, exprs.length); i++) {
     if (strings.length > i) {
-      assertNoNullChar(strings[i], "Command text");
-      text += strings[i];
+      const segment = strings[i];
+      // the engine cooks the template when it parses the literal, leaving a
+      // segment undefined if its escape sequences aren't valid JavaScript—so
+      // this is settled before templateInner ever runs. The raw segment is
+      // always a string in that case, so quote it: it's the only signal the
+      // user gets about where the offending backslash is. Every backslash in it
+      // needs escaping, not just the ones that failed to cook, because the rest
+      // silently cook to something else (ex. `\t` in a Windows path).
+      if (segment === undefined) {
+        throw new TypeError(
+          `Command text contains an invalid JavaScript escape sequence in \`${strings.raw[i]}\`. `
+            + "Escape each backslash in it to use them literally (ex. `\\\\unicode`), or "
+            + "interpolate the value instead (ex. a path via the `$.path(...)` API).",
+        );
+      }
+      assertNoNullChar(segment, "Command text");
+      text += segment;
     }
     if (exprs.length > i) {
       try {
