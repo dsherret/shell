@@ -338,10 +338,10 @@ export interface StreamFdReaderStderr {
 }
 
 export class StreamFds {
-  #readers = new Map<number, (opts?: StreamFdReaderOpts) => Reader>();
+  #readers = new Map<number, (opts: StreamFdReaderOpts) => Reader>();
   #writers = new Map<number, () => PipeWriter>();
 
-  insertReader(fd: number, stream: (opts?: StreamFdReaderOpts) => Reader) {
+  insertReader(fd: number, stream: (opts: StreamFdReaderOpts) => Reader) {
     this.#readers.set(fd, stream);
   }
 
@@ -349,7 +349,7 @@ export class StreamFds {
     this.#writers.set(fd, stream);
   }
 
-  getReader(fd: number, opts?: StreamFdReaderOpts): Reader | undefined {
+  getReader(fd: number, opts: StreamFdReaderOpts): Reader | undefined {
     return this.#readers.get(fd)?.(opts);
   }
 

@@ -1928,13 +1928,13 @@ function buildCommandRefInvokers(
  * otherwise the command was cut short like the left side of a pipe. */
 function createInterpolatedCommandRedirectReader(
   refBuilder: CommandBuilder,
-  opts: StreamFdReaderOpts | undefined,
+  opts: StreamFdReaderOpts,
 ): Reader & AsyncDisposable {
-  const linked = linkInterpolatedCommandSignals(refBuilder, opts?.signal);
+  const linked = linkInterpolatedCommandSignals(refBuilder, opts.signal);
   // start eagerly so the command still runs when the reading command reads
   // nothing, but keep the rejection observed so it's never unhandled
   const started = (async () => {
-    const { child } = await spawnCommandBuilderAsync(withInterpolatedCommandOutput(linked.builder, opts?.stderr));
+    const { child } = await spawnCommandBuilderAsync(withInterpolatedCommandOutput(linked.builder, opts.stderr));
     let streamReader: ReadableStreamDefaultReader<Uint8Array>;
     try {
       streamReader = child.stdout().getReader();
