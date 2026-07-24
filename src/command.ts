@@ -1930,7 +1930,6 @@ function createInterpolatedCommandRedirectReader(
     // observed via `read` and dispose below
   });
   let reachedEnd = false;
-  let cutShort = false;
 
   return {
     async read(p: Uint8Array): Promise<number | null> {
@@ -1952,7 +1951,7 @@ function createInterpolatedCommandRedirectReader(
     },
     async [Symbol.asyncDispose]() {
       try {
-        cutShort = !reachedEnd;
+        const cutShort = !reachedEnd;
         if (cutShort) {
           linked.kill();
         }
