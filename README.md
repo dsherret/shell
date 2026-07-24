@@ -41,6 +41,25 @@ await $.raw`echo one two three`;
 await $`echo ${$.rawArg("1   2   3")}`;
 ```
 
+### Interpolating commands
+
+Interpolating a command substitutes its captured stdout, similar to `$(...)` in a shell:
+
+```ts
+const name = $`echo world`;
+await $`echo hello ${name}`; // hello world
+await $`echo 'hello ${name}'`; // works inside quotes too
+await $`cat < ${name}`; // or as an input redirect
+```
+
+The interpolated command runs lazily when the surrounding command evaluates its arguments, so it never runs when short-circuited away (ex. the interpolated command in `` $`exit 1 && echo ${cmd}` `` doesn't run). It executes with its own configuration (env, cwd, etc.), except stdout is captured and stderr defaults to the evaluating command's stderr. If it fails, the command evaluating it fails with its exit code—add `.noThrow()` to the interpolated command to tolerate failure. As with `$(...)`, that only surfaces when nothing else determines the exit code first (ex. `` $`echo ${cmd} | cat` `` exits with `cat`'s status unless `.pipefail()` is set).
+
+Like `$(...)`, an unquoted substitution word-splits its output into multiple arguments and expands glob characters—interpolate inside quotes (ex. `` $`echo "${cmd}"` ``) to keep it a single argument.
+
+In input redirect position, `` $`cat < ${cmd}` `` streams the command's raw stdout directly to the redirect (no capture or word splitting), while a quoted `` $`cat < "${cmd}"` `` substitutes its output as a file path to read. A streamed command's exit code only propagates when the reading command consumed all of its output—when the reading command stops early it's killed and its status ignored, like the left side of a pipe.
+
+Neither interpolated values nor the literal command text may contain the NUL character (`\0`)—it's reserved as an internal delimiter, so either case throws a `TypeError`.
+
 ### `build$`
 
 `build$` creates a `$` bound to a specific `CommandBuilder` and/or with extra properties attached.

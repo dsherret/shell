@@ -27,7 +27,7 @@ jobs:
       - name: Install deno
         uses: denoland/setup-deno@v2
         with:
-          deno-version: canary
+          deno-version: 2.x
 
       - uses: actions/setup-node@v6
         with:
@@ -60,6 +60,6 @@ jobs:
       - name: Install deno
         uses: denoland/setup-deno@v2
         with:
-          deno-version: canary
+          deno-version: 2.x
       - name: Publish to JSR on tag
         run: deno run -A jsr:@david/publish-on-tag@0.2.0

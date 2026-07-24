@@ -58,7 +58,19 @@ import {
   type Writer,
   type WriterSync,
 } from "./pipes.ts";
-import { parseCommand, type ShellOptionsState, spawn } from "./shell.ts";
+import {
+  type CommandRefInvoker,
+  commandRefSentinel,
+  parseCommand,
+  replaceCommandRefSentinels,
+  replaceCommandRefSentinelsInText,
+  type SequentialList,
+  ShellEvaluateError,
+  type ShellOptionsState,
+  spawn,
+  type StreamFdReaderOpts,
+  type StreamFdReaderStderr,
+} from "./shell.ts";
 import { StreamFds } from "./shell.ts";
 
 type BufferStdio = "inherit" | "null" | "streamed" | Buffer;
@@ -86,6 +98,17 @@ interface ShellPipeWriterKindWithOptions {
 export interface CommandBuilderStateCommand {
   text: string;
   fds: StreamFds | undefined;
+  /** Command builders interpolated into the template literal, keyed by the
+   * id found in their sentinel within the text. */
+  commandRefs?: Map<number, CommandBuilder> | undefined;
+  /** Command builders interpolated into an input redirect position, keyed by
+   * the stream fd their output is wired to (ex. `` $`cat < ${$`echo 1`}` ``).
+   *
+   * Display-only: the executed text keeps the `<&<fd>` form that wires the fd
+   * reader; this map lets the display path rewrite that back to a readable
+   * `< $(...)`.
+   */
+  redirectCommandRefs?: Map<number, CommandBuilder> | undefined;
 }
 
 interface CommandBuilderState {
@@ -185,6 +208,29 @@ export const getRegisteredCommandNamesSymbol: unique symbol = Symbol();
 /** @internal */
 export const setCommandTextStateSymbol: unique symbol = Symbol();
 
+// module-private accessors assigned in the class's static block so they
+// can reach the private members
+/** @internal */
+export let getCommandBuilderState: (builder: CommandBuilder) => Readonly<CommandBuilderState>;
+// replaces the signal without `.signal()`'s permanent link to the previous one
+let commandBuilderWithSignal: (builder: CommandBuilder, signal: KillSignal) => CommandBuilder;
+// like `.spawn()`, but resolves async `beforeCommand` hooks first instead of
+// throwing when any are registered (the child is wrapped because it's itself
+// a promise and would otherwise be awaited by the caller's `await`)
+let spawnCommandBuilderAsync: (builder: CommandBuilder) => Promise<{ child: CommandChild }>;
+// reads back the signal that caused an abort from the private state, assigned
+// in KillSignal's static block so it can reach the private member
+let getAbortedSignalOf: (signal: KillSignal) => Signal | undefined;
+
+/** Gets the signal that caused a `KillSignal`'s abort, or `undefined` if it
+ * is not aborted.
+ *
+ * @internal
+ */
+export function getAbortedSignal(signal: KillSignal): Signal | undefined {
+  return getAbortedSignalOf(signal);
+}
+
 /**
  * Underlying builder API for executing commands.
  *
@@ -206,6 +252,17 @@ export const setCommandTextStateSymbol: unique symbol = Symbol();
  * ```
  */
 export class CommandBuilder implements PromiseLike<CommandResult> {
+  static {
+    getCommandBuilderState = (builder) => builder.#state;
+    commandBuilderWithSignal = (builder, signal) =>
+      builder.#newWithState((state) => {
+        state.signal = signal;
+      });
+    spawnCommandBuilderAsync = async (builder) => ({
+      child: parseAndSpawnCommand(await builder.#resolveStateForSpawn()),
+    });
+  }
+
   #state: Readonly<CommandBuilderState> = {
     command: undefined,
     combinedStdoutStderr: false,
@@ -294,7 +351,20 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
     // the thrown error's async chain.
     const callerStack = captureCallerStack(this.then);
     return this.#resolveStateForSpawn()
-      .then((state) => parseAndSpawnCommand(state, callerStack).then(onfulfilled).catch(onrejected));
+      .then((state) => {
+        try {
+          return parseAndSpawnCommand(state, callerStack);
+        } catch (err) {
+          // a synchronous throw (ex. no command set) must still reach
+          // `onrejected` below — rethrowing inside the callback rejects the
+          // chained promise, whereas the previous
+          // `parseAndSpawnCommand(...).then(onfulfilled).catch(onrejected)`
+          // shape never attached the handlers, leaving awaiters hanging
+          attachCallerStack(err, callerStack);
+          throw err;
+        }
+      })
+      .then(onfulfilled, onrejected);
   }
 
   /**
@@ -400,9 +470,12 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
       if (command instanceof Array) {
         command = command.map(escapeArg).join(" ");
       }
+      assertNoNullChar(command, "Command text");
       state.command = {
         text: command,
         fds: undefined,
+        commandRefs: undefined,
+        redirectCommandRefs: undefined,
       };
     });
   }
@@ -1184,7 +1257,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     // label, so the upfront log still runs.
     const tailHidesCommand = state.tailDisplay !== false && state.tailDisplay.header !== false;
     if (!tailHidesCommand) {
-      state.printCommandLogger.getValue()(state.command.text);
+      state.printCommandLogger.getValue()(getDisplayCommandText(state.command));
     }
   }
 
@@ -1199,9 +1272,10 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     };
     parentSignal.addListener(parentSignalListener);
     // if the parent was already aborted before the listener was added,
-    // propagate immediately since sendSignalToState already ran
+    // propagate immediately since sendSignalToState already ran, replaying its
+    // original signal so the specific abort exit code is preserved
     if (parentSignal.aborted) {
-      killSignalController.kill("SIGTERM");
+      killSignalController.kill(getAbortedSignal(parentSignal));
     }
     disposables.push({
       [Symbol.dispose]() {
@@ -1226,7 +1300,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
   // has registered with the renderer can leave a one-tick window where the
   // pinned region paints without a header.
   const resolvedTailWriterOptions = state.tailDisplay !== false
-    ? resolveTailWriterOptions(state.tailDisplay, state.command.text, Boolean(state.printCommand))
+    ? resolveTailWriterOptions(state.tailDisplay, getDisplayCommandText(state.command), Boolean(state.printCommand))
     : undefined;
   const [stdoutBuffer, stderrBuffer, combinedBuffer, tailWriters] = getBuffers();
   // ring buffers retaining the trailing N bytes of each captured stream so
@@ -1284,12 +1358,22 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
     stderrShellKind,
     stderrErrorRing != null ? wrapWithErrorTailCapture(stderrInner, stderrErrorRing) : stderrInner,
   );
-  const { text: commandText, fds } = state.command;
+  const { text: commandText, fds, commandRefs } = state.command;
   const signal = killSignalController.signal;
 
   return new CommandChild(async (resolve, reject) => {
     try {
-      const list = parseCommand(commandText);
+      let list: SequentialList;
+      try {
+        list = parseCommand(commandText);
+      } catch (err) {
+        // the parser echoes the offending text, so keep the raw sentinels of
+        // any interpolated command out of the message
+        throw replaceCommandRefSentinelsInError(err, commandRefs);
+      }
+      if (commandRefs != null) {
+        replaceCommandRefSentinels(list);
+      }
       const stdin = await takeStdin();
       let code = await spawn(list, {
         stdin: stdin instanceof ReadableStream ? readerFromStreamReader(stdin.getReader()) : stdin,
@@ -1302,6 +1386,7 @@ export function parseAndSpawnCommand(state: CommandBuilderState, callerStack?: s
         clearedEnv: state.clearEnv,
         signal,
         fds,
+        commandRefs: buildCommandRefInvokers(commandRefs),
         shellOptions: state.shellOptions,
         processTracker: state.processTracker,
       });
@@ -1805,6 +1890,263 @@ function resolveShellKind(
   return userKind;
 }
 
+function buildCommandRefInvokers(
+  commandRefs: ReadonlyMap<number, CommandBuilder> | undefined,
+): Map<number, CommandRefInvoker> | undefined {
+  if (commandRefs == null) {
+    return undefined;
+  }
+  const invokers = new Map<number, CommandRefInvoker>();
+  for (const [id, refBuilder] of commandRefs) {
+    invokers.set(id, async ({ stderr, signal }) => {
+      const linked = linkInterpolatedCommandSignals(refBuilder, signal);
+      try {
+        const result = await withInterpolatedCommandOutput(linked.builder, stderr);
+        return { kind: "text", text: result.stdout };
+      } catch (err) {
+        return {
+          kind: "failure",
+          message: interpolatedCommandFailureMessage(refBuilder, err),
+          code: interpolatedCommandFailureCode(err),
+        };
+      } finally {
+        linked.unsubscribe();
+      }
+    });
+  }
+  return invokers;
+}
+
+/** Streams an interpolated command builder's stdout into an input redirect
+ * (ex. `` $`cat < ${$`echo 1`}` ``).
+ *
+ * A failure never surfaces from `read` — the stream just ends — because the
+ * reading command would then be blamed for it with its own exit code.
+ * Instead it's reported when the redirect is disposed, so the interpolated
+ * command's exit code and stderr match the argument position's. It's only
+ * reported when the reading command consumed the output to the end, since
+ * otherwise the command was cut short like the left side of a pipe. */
+function createInterpolatedCommandRedirectReader(
+  refBuilder: CommandBuilder,
+  opts: StreamFdReaderOpts,
+): Reader & AsyncDisposable {
+  const linked = linkInterpolatedCommandSignals(refBuilder, opts.signal);
+  // start eagerly so the command still runs when the reading command reads
+  // nothing, but keep the rejection observed so it's never unhandled
+  const started = (async () => {
+    const { child } = await spawnCommandBuilderAsync(withInterpolatedCommandOutput(linked.builder, opts.stderr));
+    let streamReader: ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      streamReader = child.stdout().getReader();
+    } catch (err) {
+      // the child spawned, but its output can't be read, so it's of no use to
+      // anyone — kill it and observe it here because nothing else will
+      child.catch(() => {
+        // observe and ignore
+      });
+      linked.kill();
+      throw err;
+    }
+    return { child, streamReader, reader: readerFromStreamReader(streamReader) };
+  })();
+  started.catch(() => {
+    // observed via `read` and dispose below
+  });
+  let reachedEnd = false;
+
+  return {
+    async read(p: Uint8Array): Promise<number | null> {
+      if (reachedEnd) {
+        return null;
+      }
+      try {
+        const size = await (await started).reader.read(p);
+        if (size == null) {
+          reachedEnd = true;
+        }
+        return size;
+      } catch {
+        // spawning failed or the command errored mid-stream — end the stream
+        // and let dispose report it
+        reachedEnd = true;
+        return null;
+      }
+    },
+    async [Symbol.asyncDispose]() {
+      try {
+        const cutShort = !reachedEnd;
+        if (cutShort) {
+          linked.kill();
+        }
+        let child: CommandChild;
+        try {
+          ({ child } = await started);
+        } catch (err) {
+          // failing to spawn is a configuration error rather than a command
+          // that got cut short, so always report it
+          throw new ShellEvaluateError(
+            interpolatedCommandFailureMessage(refBuilder, err),
+            interpolatedCommandFailureCode(err),
+          );
+        }
+        try {
+          await child;
+        } catch (err) {
+          if (!cutShort) {
+            throw new ShellEvaluateError(
+              interpolatedCommandFailureMessage(refBuilder, err),
+              interpolatedCommandFailureCode(err),
+            );
+          }
+        }
+      } finally {
+        linked.unsubscribe();
+        await started.then(({ streamReader }) => streamReader.cancel(), () => {}).catch(() => {
+          // ignore, the stream may have errored
+        });
+      }
+    },
+  };
+}
+
+/** Captures an interpolated command's stdout and, when it would otherwise go
+ * to the process's stderr, routes its stderr to the evaluating command's. */
+function withInterpolatedCommandOutput(
+  builder: CommandBuilder,
+  stderr: StreamFdReaderStderr | undefined,
+): CommandBuilder {
+  const result = builder.stdout("piped");
+  const stderrKind = getCommandBuilderState(builder).stderr.kind;
+  if (stderr == null || stderrKind !== "inherit" && stderrKind !== "inheritPiped") {
+    return result;
+  }
+  return result.stderr(writableStreamFromShellPipeWriter(stderr));
+}
+
+function interpolatedCommandFailureMessage(refBuilder: CommandBuilder, err: unknown): string {
+  const refCommand = getCommandBuilderState(refBuilder).command;
+  const displayText = refCommand == null ? undefined : getDisplayCommandText(refCommand);
+  return `failed evaluating interpolated command${displayText == null ? "" : ` \`${displayText}\``}. `
+    + errorToString(err);
+}
+
+function interpolatedCommandFailureCode(err: unknown): number {
+  return err instanceof ShellError ? err.exitCode : 1;
+}
+
+/** Gives an interpolated command builder a fresh signal that gets killed by
+ * the evaluating command's signal and the builder's own signal (but not the
+ * other way around), with the links removable once the invocation finishes.
+ *
+ * @internal
+ */
+export function linkInterpolatedCommandSignals(
+  refBuilder: CommandBuilder,
+  outerSignal: KillSignal | undefined,
+): { builder: CommandBuilder; kill(): void; unsubscribe(): void } {
+  const controller = new KillController();
+  const links: { unsubscribe(): void }[] = [];
+  const ownSignal = getCommandBuilderState(refBuilder).signal;
+  if (outerSignal != null) {
+    links.push(outerSignal.linkChild(controller.signal));
+  }
+  if (ownSignal != null) {
+    links.push(ownSignal.linkChild(controller.signal));
+  }
+  // linkChild only forwards future kills, so replay an already-aborted signal
+  // with its original signal to preserve the specific abort exit code. When
+  // both are aborted the outer (evaluating command's) signal wins.
+  const abortedSignal = (outerSignal != null ? getAbortedSignal(outerSignal) : undefined)
+    ?? (ownSignal != null ? getAbortedSignal(ownSignal) : undefined);
+  if (abortedSignal != null) {
+    controller.kill(abortedSignal);
+  }
+  return {
+    builder: commandBuilderWithSignal(refBuilder, controller.signal),
+    kill() {
+      controller.kill();
+    },
+    unsubscribe() {
+      for (const link of links) {
+        link.unsubscribe();
+      }
+    },
+  };
+}
+
+/** Gets the command text with any command ref sentinels replaced with the
+ * interpolated command's text (ex. for `printCommand` output). */
+function getDisplayCommandText(command: Readonly<CommandBuilderStateCommand>): string {
+  return getDisplayText(command.text, command.commandRefs, command.redirectCommandRefs);
+}
+
+/** Rewrites the sentinels the parser echoes back in its errors (it's handed
+ * the text before they're resolved), which are otherwise unreadable NULs. */
+function replaceCommandRefSentinelsInError(
+  err: unknown,
+  commandRefs: ReadonlyMap<number, CommandBuilder> | undefined,
+): unknown {
+  if (commandRefs == null) {
+    return err;
+  }
+  // the parser throws strings rather than errors
+  if (typeof err === "string") {
+    return getDisplayText(err, commandRefs);
+  }
+  if (err instanceof Error) {
+    err.message = getDisplayText(err.message, commandRefs);
+  }
+  return err;
+}
+
+function getDisplayText(
+  text: string,
+  commandRefs: ReadonlyMap<number, CommandBuilder> | undefined,
+  redirectCommandRefs?: ReadonlyMap<number, CommandBuilder> | undefined,
+): string {
+  // resolve this command's own redirect fds BEFORE injecting arg-ref display
+  // text below. an arg-ref's resolved text can contain a residual `<&<fd>` (a
+  // non-builder stream it reads from correctly keeps its fd form), and fd
+  // numbers collide across nesting levels since each `templateInner` restarts
+  // at 3 — running this after injection would let this rewrite clobber the
+  // inner's identically-numbered fd. running first, it only ever sees this
+  // command's own `<&<fd>`, each unique within one level.
+  if (redirectCommandRefs != null) {
+    // an interpolated command in an input redirect executes as `<&<fd>` (the
+    // reader is wired to that fd), which is meaningless to a reader — rewrite
+    // it back to `cat < $(echo 1)`. only the fds we generated for a command
+    // builder are rewritten, so a user-written `<&N`/`>&N` or a non-builder
+    // stream reader keeps its fd form. a single left-to-right pass (rather than
+    // one global replace per fd) ensures an fd's injected display text is never
+    // re-scanned — otherwise a later fd could match an identical number inside
+    // it (ex. a nested non-builder `<&4` vs an outer redirect at fd 4).
+    text = text.replace(/<&(\d+)(?![0-9])/g, (match, fdText) => {
+      const refBuilder = redirectCommandRefs.get(Number(fdText));
+      if (refBuilder == null) {
+        return match;
+      }
+      const refCommand = getCommandBuilderState(refBuilder).command;
+      return `< $(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
+    });
+  }
+  if (commandRefs != null) {
+    text = replaceCommandRefSentinelsInText(text, (id) => {
+      const refBuilder = commandRefs.get(id);
+      const refCommand = refBuilder == null ? undefined : getCommandBuilderState(refBuilder).command;
+      return `$(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
+    });
+  }
+  return text;
+}
+
+function writableStreamFromShellPipeWriter(writer: StreamFdReaderStderr): WritableStream<Uint8Array> {
+  return new WritableStream({
+    async write(chunk) {
+      await writer.writeAll(chunk);
+    },
+  });
+}
+
 /** Wrap a writer with the right sync/async error-context tap based on
  * whether the inner exposes async `write` or sync `writeSync` — mirrors
  * the same dispatch `ShellPipeWriter.write` uses, so the wrapper appears
@@ -1940,6 +2282,9 @@ const SHELL_SIGNAL_CTOR_SYMBOL = Symbol();
 
 interface KillSignalState {
   abortedCode: number | undefined;
+  // the signal that caused the abort, retained so a later catch-up can replay
+  // the exact signal rather than defaulting to SIGTERM and losing the code
+  abortedSignal: Signal | undefined;
   listeners: ((signal: Signal) => void)[];
 }
 
@@ -1951,6 +2296,7 @@ export class KillController {
   constructor() {
     this.#state = {
       abortedCode: undefined,
+      abortedSignal: undefined,
       listeners: [],
     };
     this.#killSignal = new KillSignal(SHELL_SIGNAL_CTOR_SYMBOL, this.#state);
@@ -1982,6 +2328,10 @@ export type KillSignalListener = (signal: Signal) => void;
  * These can be created via a `KillController`.
  */
 export class KillSignal {
+  static {
+    getAbortedSignalOf = (signal) => signal.#state.abortedSignal;
+  }
+
   #state: KillSignalState;
 
   /** @internal */
@@ -2051,6 +2401,7 @@ function sendSignalToState(state: KillSignalState, signal: Signal) {
   const code = getSignalAbortCode(signal);
   if (code !== undefined) {
     state.abortedCode = code;
+    state.abortedSignal = signal;
   }
   // copy in case a listener adds/removes listeners while being invoked
   for (const listener of [...state.listeners]) {
@@ -2105,6 +2456,7 @@ export type NonRedirectTemplateExpr =
   | Path
   | Uint8Array
   | CommandResult
+  | CommandBuilder
   | RawArg<NonRedirectTemplateExpr>
   | { toString(): string; catch?: never };
 /** Any value that may be interpolated into a `$` template literal command. */
@@ -2133,10 +2485,35 @@ function templateInner(
   let nextStreamFd = 3;
   let text = "";
   let streams: StreamFds | undefined;
+  let commandRefs: Map<number, CommandBuilder> | undefined;
+  let redirectCommandRefs: Map<number, CommandBuilder> | undefined;
   const exprsCount = exprs.length;
+  const redirectScanner = createRedirectScanner();
+  const registerCommandRef = (builder: CommandBuilder): string => {
+    commandRefs ??= new Map();
+    const id = commandRefs.size;
+    commandRefs.set(id, builder);
+    return commandRefSentinel(id);
+  };
   for (let i = 0; i < Math.max(strings.length, exprs.length); i++) {
     if (strings.length > i) {
-      text += strings[i];
+      const segment = strings[i];
+      // the engine cooks the template when it parses the literal, leaving a
+      // segment undefined if its escape sequences aren't valid JavaScript—so
+      // this is settled before templateInner ever runs. The raw segment is
+      // always a string in that case, so quote it: it's the only signal the
+      // user gets about where the offending backslash is. Every backslash in it
+      // needs escaping, not just the ones that failed to cook, because the rest
+      // silently cook to something else (ex. `\t` in a Windows path).
+      if (segment === undefined) {
+        throw new TypeError(
+          `Command text contains an invalid JavaScript escape sequence in \`${strings.raw[i]}\`. `
+            + "Escape each backslash in it to use them literally (ex. `\\\\unicode`), or "
+            + "interpolate the value instead (ex. a path via the `$.path(...)` API).",
+        );
+      }
+      assertNoNullChar(segment, "Command text");
+      text += segment;
     }
     if (exprs.length > i) {
       try {
@@ -2144,10 +2521,12 @@ function templateInner(
         if (expr == null) {
           throw "Expression was null or undefined.";
         }
-        const inputOrOutputRedirect = detectInputOrOutputRedirect(text);
+        const inputOrOutputRedirect = redirectScanner.scan(text);
         if (inputOrOutputRedirect === "<") {
           if (expr instanceof Path) {
-            text += templateLiteralExprToString(expr, escape);
+            text += templateLiteralExprToString(expr, escape, registerCommandRef);
+          } else if (expr instanceof CommandBuilder) {
+            handleCommandBuilderRedirect(unwrapCommandBuilder(expr) ?? expr);
           } else if (typeof expr === "string") {
             handleReadableStream(() =>
               new ReadableStream({
@@ -2209,7 +2588,7 @@ function templateInner(
           }
         } else if (inputOrOutputRedirect === ">") {
           if (expr instanceof Path) {
-            text += templateLiteralExprToString(expr, escape);
+            text += templateLiteralExprToString(expr, escape, registerCommandRef);
           } else if (expr instanceof WritableStream) {
             handleWritableStream(() => expr);
           } else if (expr instanceof Uint8Array) {
@@ -2264,7 +2643,7 @@ function templateInner(
             throw new TypeError("Unsupported object provided to output redirect.");
           }
         } else {
-          text += templateLiteralExprToString(expr, escape);
+          text += templateLiteralExprToString(expr, escape, registerCommandRef);
         }
       } catch (err) {
         const startMessage = exprsCount === 1
@@ -2282,6 +2661,8 @@ function templateInner(
   return {
     text,
     fds: streams,
+    commandRefs,
+    redirectCommandRefs,
   };
 
   function handleReadableStream(createStream: () => ReadableStream) {
@@ -2296,7 +2677,7 @@ function templateInner(
         },
       };
     });
-    text = text.trimEnd() + "&" + fd;
+    appendStreamFd(fd);
   }
 
   function handleWritableStream(createStream: () => WritableStream) {
@@ -2317,37 +2698,130 @@ function templateInner(
         },
       };
     });
+    appendStreamFd(fd);
+  }
+
+  function handleCommandBuilderRedirect(builder: CommandBuilder) {
+    streams ??= new StreamFds();
+    const fd = nextStreamFd++;
+    streams.insertReader(fd, (opts) => createInterpolatedCommandRedirectReader(builder, opts));
+    // remember the builder so the display path can render `<&<fd>` back as a
+    // readable `< $(...)` (the executed text keeps the fd form)
+    redirectCommandRefs ??= new Map();
+    redirectCommandRefs.set(fd, builder);
+    appendStreamFd(fd);
+  }
+
+  /** Makes the pending redirect operator target the stream's fd
+   * (ex. `cat < ` becomes `cat <&3`). */
+  function appendStreamFd(fd: number) {
     text = text.trimEnd() + "&" + fd;
+    redirectScanner.resyncAfterRedirect(text);
   }
 }
 
-function detectInputOrOutputRedirect(text: string) {
-  text = text.trimEnd();
-  if (text.endsWith(">")) {
-    return ">";
-  } else if (text.endsWith("<")) {
-    return "<";
-  } else {
-    return undefined;
-  }
+/** Creates a scanner that detects a trailing redirect operator that the next
+ * expression redirects to. Quoted operators are literal text rather than a
+ * redirect (ex. the `<` in `` $`echo 'a < ${expr}'` ``), so the quoting is
+ * tracked to the end.
+ *
+ * Scanning is incremental because the text grows with every expression and
+ * an expression may be megabytes large—rescanning from the start each time
+ * would make building a command quadratic.
+ */
+export function createRedirectScanner(): {
+  scan(text: string): "<" | ">" | undefined;
+  resyncAfterRedirect(text: string): void;
+} {
+  let quoteChar: '"' | "'" | undefined;
+  let escaped = false;
+  let redirect: "<" | ">" | undefined;
+  let scannedLength = 0;
+  return {
+    /** Scans whatever text was appended since the previous call and returns
+     * the redirect operator that an expression substituted here would
+     * redirect to. */
+    scan(text: string): "<" | ">" | undefined {
+      for (let i = scannedLength; i < text.length; i++) {
+        const char = text[i];
+        if (quoteChar === "'") {
+          // a backslash isn't an escape within single quotes
+          if (char === "'") {
+            quoteChar = undefined;
+          }
+          redirect = undefined;
+        } else if (escaped) {
+          escaped = false; // the escaped character is literal text
+          redirect = undefined;
+        } else if (char === "\\") {
+          escaped = true;
+          redirect = undefined;
+        } else if (quoteChar === '"') {
+          if (char === '"') {
+            quoteChar = undefined;
+          }
+          redirect = undefined;
+        } else if (char === '"' || char === "'") {
+          quoteChar = char;
+          redirect = undefined;
+        } else if (char === "<" || char === ">") {
+          redirect = char;
+        } else if (!isWhitespace(char)) {
+          redirect = undefined;
+        }
+      }
+      scannedLength = text.length;
+      return redirect;
+    },
+    /** Resyncs after the pending redirect's trailing whitespace was replaced
+     * with a stream's fd (ex. `cat < ` becomes `cat <&3`).
+     *
+     * Only call this with the text of a redirect that {@link scan} just
+     * returned—the text may now be shorter than what was scanned, so resuming
+     * from its end is only correct because everything up to the operator was
+     * already scanned.
+     *
+     * None of the rewrite can affect the quoting: a redirect is only pending
+     * outside of quotes with no escape pending, only whitespace is removed,
+     * and the appended `&<fd>` is plain text that satisfies the redirect. */
+    resyncAfterRedirect(text: string) {
+      redirect = undefined;
+      scannedLength = text.length;
+    },
+  };
 }
 
-function templateLiteralExprToString(expr: TemplateExpr, escape: ((arg: string) => string) | undefined): string {
+/** Equivalent to `/\s/`, but avoids the regex for the ascii characters that
+ * make up nearly all command text. */
+function isWhitespace(char: string) {
+  const code = char.charCodeAt(0);
+  if (code < 0x80) {
+    // space, tab, line feed, vertical tab, form feed and carriage return
+    return code === 0x20 || (code >= 0x09 && code <= 0x0d);
+  }
+  return /\s/.test(char);
+}
+
+function templateLiteralExprToString(
+  expr: TemplateExpr,
+  escape: ((arg: string) => string) | undefined,
+  registerCommandRef: (builder: CommandBuilder) => string,
+): string {
   let result: string;
   if (typeof expr === "string") {
     result = expr;
   } else if (expr instanceof Array) {
-    return expr.map((e) => templateLiteralExprToString(e, escape)).join(" ");
+    return expr.map((e) => templateLiteralExprToString(e, escape, registerCommandRef)).join(" ");
   } else if (expr instanceof CommandResult) {
     // remove last newline
     result = expr.stdout.replace(/\r?\n$/, "");
   } else if (expr instanceof CommandBuilder) {
-    throw new TypeError(
-      "Providing a command builder is not yet supported (https://github.com/dsherret/dax/issues/239). "
-        + "Await the command builder's text before using it in an expression (ex. await $`cmd`.text()).",
-    );
+    // substitute a sentinel that the executor lazily resolves to the
+    // command builder's stdout when evaluating the surrounding word
+    // (unwrapping the non-thenable proxy handed to beforeCommand callbacks)
+    return registerCommandRef(unwrapCommandBuilder(expr) ?? expr);
   } else if (expr instanceof RawArg) {
-    return templateLiteralExprToString(expr.value, undefined);
+    return templateLiteralExprToString(expr.value, undefined, registerCommandRef);
   } else if (typeof expr === "object" && expr.toString === Object.prototype.toString) {
     if (expr instanceof Promise) {
       throw new TypeError("Provided object was a Promise. Please await it before providing it.");
@@ -2357,7 +2831,18 @@ function templateLiteralExprToString(expr: TemplateExpr, escape: ((arg: string) 
   } else {
     result = `${expr}`;
   }
+  assertNoNullChar(result, "Provided value");
   return escape ? escape(result) : result;
+}
+
+/** Command ref sentinels are delimited by NUL, so NUL must never reach the
+ * command text from a value, otherwise a value that happened to contain a
+ * sentinel would be resolved as an interpolated command. It's never valid in
+ * a command anyway. */
+function assertNoNullChar(text: string, subject: string): void {
+  if (text.includes("\0")) {
+    throw new TypeError(`${subject} cannot contain the NUL character (\\0).`);
+  }
 }
 
 function writerFromStreamWriter(
