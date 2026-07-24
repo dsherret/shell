@@ -3168,6 +3168,80 @@ Deno.test("command builder interpolation - printCommand shows the inner command 
   assertEquals(logs, ["echo $(echo 1)"]);
 });
 
+Deno.test("command builder interpolation - printCommand shows the inner command text in an input redirect", async () => {
+  const logs: string[] = [];
+  const inner = $`echo 1`;
+  // the interpolated command executes as `cat <&3` (its output wired to fd 3),
+  // but the printed text should render the readable form instead
+  const outer = $`cat < ${inner}`.printCommand();
+  outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
+  assertEquals(await outer.text(), "1");
+  assertEquals(logs, ["cat < $(echo 1)"]);
+});
+
+Deno.test("command builder interpolation - printCommand recurses into a nested input redirect", async () => {
+  const logs: string[] = [];
+  // the inner command itself interpolates a command into an input redirect
+  const outer = $`cat < ${$`cat < ${$`echo 1`}`}`.printCommand();
+  outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
+  assertEquals(await outer.text(), "1");
+  assertEquals(logs, ["cat < $(cat < $(echo 1))"]);
+});
+
+Deno.test("command builder interpolation - printCommand leaves a non-builder stream redirect as its fd", async () => {
+  const logs: string[] = [];
+  // a plain ReadableStream has no command to show, so it must keep its fd form
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("hi"));
+      controller.close();
+    },
+  });
+  const outer = $`cat < ${stream}`.printCommand();
+  outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
+  assertEquals(await outer.text(), "hi");
+  assertEquals(logs, ["cat <&3"]);
+});
+
+Deno.test("command builder interpolation - printCommand doesn't cross-label an arg-ref's fd with a redirect at the same fd", async () => {
+  const logs: string[] = [];
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("S"));
+      controller.close();
+    },
+  });
+  // the arg-ref (`cat < ${stream}`) reads a non-builder stream that stays as
+  // `<&3`, while the outer redirect builder (`echo R`) also lands on fd 3 since
+  // fd numbering restarts per level — the two must not be conflated
+  const outer = $`echo ${$`cat < ${stream}`} < ${$`echo R`}`.printCommand();
+  outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
+  await outer.then(() => {}, () => {});
+  assertEquals(logs, ["echo $(cat <&3) < $(echo R)"]);
+});
+
+Deno.test("command builder interpolation - printCommand keeps redirect fds distinct across a multi-redirect (latent)", async () => {
+  // multiple redirects on one command aren't supported yet (they throw at
+  // spawn), so only the pre-spawn printCommand log is exercised here. this
+  // pins the display so a future multi-redirect feature can't silently ship
+  // the cross-fd corruption: the arg-ref's inner non-builder streams stay as
+  // `<&3 <&4` and the outer redirect at fd 4 shows `$(echo Z)`.
+  const logs: string[] = [];
+  const makeStream = (text: string) =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(text));
+        controller.close();
+      },
+    });
+  const outer = $`cat < ${$`cat < ${makeStream("1")} < ${makeStream("2")}`} < ${$`echo Z`}`.printCommand();
+  outer.setPrintCommandLogger((...args) => logs.push(args.join(" ")));
+  // swallow the "Multiple redirects are currently not supported" spawn error;
+  // the printCommand log has already fired synchronously before it
+  await outer.then(() => {}, () => {});
+  assertEquals(logs, ["cat < $(cat <&3 <&4) < $(echo Z)"]);
+});
+
 Deno.test("command builder interpolation - parse errors show the inner command text instead of a sentinel", async () => {
   const error = await $`echo ~${$`echo 1`}`.then(() => undefined, (err) => err);
   const text = typeof error === "string" ? error : String(error?.message ?? error);

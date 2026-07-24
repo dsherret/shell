@@ -101,6 +101,14 @@ export interface CommandBuilderStateCommand {
   /** Command builders interpolated into the template literal, keyed by the
    * id found in their sentinel within the text. */
   commandRefs?: Map<number, CommandBuilder> | undefined;
+  /** Command builders interpolated into an input redirect position, keyed by
+   * the stream fd their output is wired to (ex. `` $`cat < ${$`echo 1`}` ``).
+   *
+   * Display-only: the executed text keeps the `<&<fd>` form that wires the fd
+   * reader; this map lets the display path rewrite that back to a readable
+   * `< $(...)`.
+   */
+  redirectCommandRefs?: Map<number, CommandBuilder> | undefined;
 }
 
 interface CommandBuilderState {
@@ -467,6 +475,7 @@ export class CommandBuilder implements PromiseLike<CommandResult> {
         text: command,
         fds: undefined,
         commandRefs: undefined,
+        redirectCommandRefs: undefined,
       };
     });
   }
@@ -2068,7 +2077,7 @@ export function linkInterpolatedCommandSignals(
 /** Gets the command text with any command ref sentinels replaced with the
  * interpolated command's text (ex. for `printCommand` output). */
 function getDisplayCommandText(command: Readonly<CommandBuilderStateCommand>): string {
-  return getDisplayText(command.text, command.commandRefs);
+  return getDisplayText(command.text, command.commandRefs, command.redirectCommandRefs);
 }
 
 /** Rewrites the sentinels the parser echoes back in its errors (it's handed
@@ -2090,15 +2099,44 @@ function replaceCommandRefSentinelsInError(
   return err;
 }
 
-function getDisplayText(text: string, commandRefs: ReadonlyMap<number, CommandBuilder> | undefined): string {
-  if (commandRefs == null) {
-    return text;
+function getDisplayText(
+  text: string,
+  commandRefs: ReadonlyMap<number, CommandBuilder> | undefined,
+  redirectCommandRefs?: ReadonlyMap<number, CommandBuilder> | undefined,
+): string {
+  // resolve this command's own redirect fds BEFORE injecting arg-ref display
+  // text below. an arg-ref's resolved text can contain a residual `<&<fd>` (a
+  // non-builder stream it reads from correctly keeps its fd form), and fd
+  // numbers collide across nesting levels since each `templateInner` restarts
+  // at 3 — running this after injection would let this rewrite clobber the
+  // inner's identically-numbered fd. running first, it only ever sees this
+  // command's own `<&<fd>`, each unique within one level.
+  if (redirectCommandRefs != null) {
+    // an interpolated command in an input redirect executes as `<&<fd>` (the
+    // reader is wired to that fd), which is meaningless to a reader — rewrite
+    // it back to `cat < $(echo 1)`. only the fds we generated for a command
+    // builder are rewritten, so a user-written `<&N`/`>&N` or a non-builder
+    // stream reader keeps its fd form. a single left-to-right pass (rather than
+    // one global replace per fd) ensures an fd's injected display text is never
+    // re-scanned — otherwise a later fd could match an identical number inside
+    // it (ex. a nested non-builder `<&4` vs an outer redirect at fd 4).
+    text = text.replace(/<&(\d+)(?![0-9])/g, (match, fdText) => {
+      const refBuilder = redirectCommandRefs.get(Number(fdText));
+      if (refBuilder == null) {
+        return match;
+      }
+      const refCommand = getCommandBuilderState(refBuilder).command;
+      return `< $(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
+    });
   }
-  return replaceCommandRefSentinelsInText(text, (id) => {
-    const refBuilder = commandRefs.get(id);
-    const refCommand = refBuilder == null ? undefined : getCommandBuilderState(refBuilder).command;
-    return `$(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
-  });
+  if (commandRefs != null) {
+    text = replaceCommandRefSentinelsInText(text, (id) => {
+      const refBuilder = commandRefs.get(id);
+      const refCommand = refBuilder == null ? undefined : getCommandBuilderState(refBuilder).command;
+      return `$(${refCommand == null ? "<unresolved>" : getDisplayCommandText(refCommand)})`;
+    });
+  }
+  return text;
 }
 
 function writableStreamFromShellPipeWriter(writer: StreamFdReaderStderr): WritableStream<Uint8Array> {
@@ -2448,6 +2486,7 @@ function templateInner(
   let text = "";
   let streams: StreamFds | undefined;
   let commandRefs: Map<number, CommandBuilder> | undefined;
+  let redirectCommandRefs: Map<number, CommandBuilder> | undefined;
   const exprsCount = exprs.length;
   const redirectScanner = createRedirectScanner();
   const registerCommandRef = (builder: CommandBuilder): string => {
@@ -2623,6 +2662,7 @@ function templateInner(
     text,
     fds: streams,
     commandRefs,
+    redirectCommandRefs,
   };
 
   function handleReadableStream(createStream: () => ReadableStream) {
@@ -2665,6 +2705,10 @@ function templateInner(
     streams ??= new StreamFds();
     const fd = nextStreamFd++;
     streams.insertReader(fd, (opts) => createInterpolatedCommandRedirectReader(builder, opts));
+    // remember the builder so the display path can render `<&<fd>` back as a
+    // readable `< $(...)` (the executed text keeps the fd form)
+    redirectCommandRefs ??= new Map();
+    redirectCommandRefs.set(fd, builder);
     appendStreamFd(fd);
   }
 
