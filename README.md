@@ -58,6 +58,8 @@ Like `$(...)`, an unquoted substitution word-splits its output into multiple arg
 
 In input redirect position, `` $`cat < ${cmd}` `` streams the command's raw stdout directly to the redirect (no capture or word splitting), while a quoted `` $`cat < "${cmd}"` `` substitutes its output as a file path to read. A streamed command's exit code only propagates when the reading command consumed all of its output—when the reading command stops early it's killed and its status ignored, like the left side of a pipe.
 
+Neither interpolated values nor the literal command text may contain the NUL character (`\0`)—it's reserved as an internal delimiter, so either case throws a `TypeError`.
+
 ### `build$`
 
 `build$` creates a `$` bound to a specific `CommandBuilder` and/or with extra properties attached.
