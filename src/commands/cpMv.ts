@@ -86,7 +86,10 @@ async function doCopyOperation(
       } else if (fromInfo.isSymbolicLink()) {
         throw Error("no support for copying from symlinks");
       } else {
-        await fs.promises.cp(from.path, to.path, { recursive: true });
+        // verbatimSymlinks matches GNU cp -r, which preserves a symlink's
+        // target as written instead of resolving relative targets to
+        // absolute paths pointing back into the source directory
+        await fs.promises.cp(from.path, to.path, { recursive: true, verbatimSymlinks: true });
       }
     } else {
       throw Error("source was a directory; maybe specify -r");
