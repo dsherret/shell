@@ -3,6 +3,7 @@
   "specifiers": {
     "jsr:@david/code-block-writer@^13.0.3": "13.0.3",
     "jsr:@david/console-static-text@~0.3.4": "0.3.4",
+    "jsr:@david/gagen@0.6": "0.6.0",
     "jsr:@david/path@0.2": "0.2.0",
     "jsr:@david/path@0.3": "0.3.3",
     "jsr:@david/path@~0.3.3": "0.3.3",
@@ -29,6 +30,7 @@
     "jsr:@std/semver@1": "1.0.8",
     "jsr:@std/streams@^1.0.17": "1.1.1",
     "jsr:@std/tar@~0.1.4": "0.1.10",
+    "jsr:@std/yaml@^1.1.2": "1.1.2",
     "jsr:@ts-morph/bootstrap@0.29": "0.29.0",
     "jsr:@ts-morph/common@0.29": "0.29.0",
     "npm:esbuild@~0.28.1": "0.28.1"
@@ -39,6 +41,12 @@
     },
     "@david/console-static-text@0.3.4": {
       "integrity": "1c596f500b075ff3c8bab1d328ca7148a88067fd9a506b16a73eeaf230c229fd"
+    },
+    "@david/gagen@0.6.0": {
+      "integrity": "8cc5b329b8d29fa741c343ff9dcd55a7d802d8ac62450b2512161ff946fe336f",
+      "dependencies": [
+        "jsr:@std/yaml"
+      ]
     },
     "@david/path@0.2.0": {
       "integrity": "f2d7aa7f02ce5a55e27c09f9f1381794acb09d328f8d3c8a2e3ab3ffc294dccd",
@@ -150,6 +158,9 @@
       "dependencies": [
         "jsr:@std/streams"
       ]
+    },
+    "@std/yaml@1.1.2": {
+      "integrity": "de612653c036749ba2044165e316f52412b0f0698afffb7ee80b5331d6d2abae"
     },
     "@ts-morph/bootstrap@0.29.0": {
       "integrity": "69f9b1b42b03423308a9f623f924174181ef20f6f2a8771799f216f561b9b7a6",
@@ -333,6 +344,7 @@
   "workspace": {
     "dependencies": [
       "jsr:@david/console-static-text@~0.3.4",
+      "jsr:@david/gagen@0.6",
       "jsr:@david/path@~0.3.3",
       "jsr:@david/publish-on-tag@0.2.0",
       "jsr:@david/temp@~0.2.1",
