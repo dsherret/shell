@@ -44,6 +44,7 @@ await build({
       name: "@dsherret/path",
     },
   },
+  polyfills: false,
   compilerOptions: {
     stripInternal: false,
     skipLibCheck: false,
