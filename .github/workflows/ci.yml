@@ -50,6 +50,37 @@ jobs:
       - name: node test
         run: deno task test:node
 
+  npm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.x
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Get tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        id: get_tag_version
+        run: echo TAG_VERSION=${GITHUB_REF/refs\/tags\//} >> $GITHUB_OUTPUT
+
+      - name: npm build
+        run: deno task dnt ${{steps.get_tag_version.outputs.TAG_VERSION}}
+
+      - name: npm publish
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cd npm && npm publish --access public
+
   jsr:
     runs-on: ubuntu-latest
     permissions:

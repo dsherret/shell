@@ -60,3 +60,4 @@ export type { Signal } from "./src/signal.ts";
 export { type Delay, delayToMs } from "./src/common.ts";
 export type { ConsoleSize } from "@david/console-static-text";
 export { FsFileWrapper, Path } from "@david/path";
+export { which, whichSync } from "which";

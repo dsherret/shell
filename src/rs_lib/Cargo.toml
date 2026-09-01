@@ -8,8 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1.6"
-deno_task_shell = { git = "https://github.com/mrgrain/deno_task_shell", branch = "mrgrain/fix/parser/reserved-words-in-argument-position", default-features = false, features = ["serialization"] }
-js-sys = "=0.3.77"
+deno_task_shell = { version = "0.33.3", default-features = false, features = ["serialization"] }
+js-sys = "=0.3.85"
 serde = "1"
 serde-wasm-bindgen = "=0.6.5"
-wasm-bindgen = "=0.2.100"
+wasm-bindgen = "=0.2.108"
