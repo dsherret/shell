@@ -2446,6 +2446,27 @@ Deno.test("cp -r with trailing dot copies directory contents", async () => {
   });
 });
 
+Deno.test("cp -r preserves relative symlinks", {
+  ignore: process.platform === "win32", // creating symlinks on windows requires elevated privileges
+}, async () => {
+  await withTempDir(async (dir) => {
+    // https://github.com/dsherret/dax/issues/410
+    await $`mkdir src`;
+    dir.join("src/real.so.1.0.0").writeSync("lib");
+    await fs.promises.symlink("real.so.1.0.0", dir.join("src/real.so.1").toString());
+
+    await $`cp -r src dest`;
+
+    const linkPath = dir.join("dest/real.so.1");
+    const stat = await fs.promises.lstat(linkPath.toString());
+    assert(stat.isSymbolicLink(), "should be a symlink");
+    // the target should be preserved as written, not resolved to an
+    // absolute path into the source directory
+    assertEquals(await fs.promises.readlink(linkPath.toString()), "real.so.1.0.0");
+    assertEquals(linkPath.readTextSync(), "lib");
+  });
+});
+
 Deno.test("move test", async () => {
   await withTempDir(async (dir) => {
     const file1 = dir.join("file1.txt");
