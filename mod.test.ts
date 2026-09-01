@@ -2619,9 +2619,9 @@ Deno.test("should error creating a command signal", () => {
 
 Deno.test("kill signal: a throwing listener doesn't stop dispatch to the remaining listeners", () => {
   // capture the rethrows instead of letting them become uncaught errors
-  const scheduled: VoidFunction[] = [];
+  const scheduled: (() => void)[] = [];
   const originalQueueMicrotask = globalThis.queueMicrotask;
-  globalThis.queueMicrotask = (fn: VoidFunction) => scheduled.push(fn);
+  globalThis.queueMicrotask = (fn: () => void) => scheduled.push(fn);
   try {
     const controller = new KillController();
     controller.signal.addListener(() => {

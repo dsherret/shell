@@ -1,6 +1,6 @@
 # shell
 
-[![JSR](https://jsr.io/badges/@david/shell)](https://jsr.io/@david/shell)
+[![JSR](https://jsr.io/badges/@david/shell)](https://jsr.io/@david/shell) [![npm](https://img.shields.io/npm/v/@dsherret/shell)](https://www.npmjs.com/package/@dsherret/shell)
 
 Command execution and shell parser used by [`dax`](https://github.com/dsherret/dax).
 
@@ -11,11 +11,11 @@ Works on Deno and Node.js.
 ## Install
 
 ```sh
-# Deno
+# jsr
 deno add jsr:@david/shell
 
-# Node
-npx jsr add @david/shell
+# npm (esm only)
+npm install @dsherret/shell
 ```
 
 ## Usage
