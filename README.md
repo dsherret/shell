@@ -11,11 +11,11 @@ Works on Deno and Node.js.
 ## Install
 
 ```sh
+# npm
+npm install @dsherret/shell
+
 # jsr
 deno add jsr:@david/shell
-
-# npm (esm only)
-npm install @dsherret/shell
 ```
 
 ## Usage
