@@ -987,6 +987,12 @@ export class PipeSequencePipe implements Reader, WriterSync {
   }
 }
 
+/** Pipes the reader to a process's stdin.
+ *
+ * Failures writing to or closing the writable are not surfaced because they
+ * mean the process stopped reading, so don't use this for a writable where
+ * losing data is an error (ex. a file).
+ */
 export async function pipeReaderToWritable(
   reader: Reader,
   writable: WritableStream<Uint8Array>,
