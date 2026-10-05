@@ -1001,10 +1001,20 @@ export async function pipeReaderToWritable(
       if (length === 0 || length == null) {
         break;
       }
-      await writer.write(buffer.subarray(0, length));
+      try {
+        await writer.write(buffer.subarray(0, length));
+      } catch {
+        // the other end stopped reading (ex. the process exited or closed its
+        // stdin), which like a SIGPIPE isn't a failure of the pipe
+        break;
+      }
     }
   } finally {
-    await writer.close();
+    try {
+      await writer.close();
+    } catch {
+      // already closed or errored because the other end went away
+    }
   }
 }
 

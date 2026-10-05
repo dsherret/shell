@@ -1329,6 +1329,67 @@ Deno.test("piping to stdin", async (t) => {
     assertEquals(result.code, 1);
     assertEquals(result.stderr, "stdin pipe broken. Exited with code: 1\n");
   });
+
+  // the slow stdout keeps the command from completing after the process
+  // exits, which is when the stdin pipe finds out the process is gone
+  const slowWritable = (onWrite?: () => void) =>
+    new WritableStream<Uint8Array>({
+      async write() {
+        onWrite?.();
+        await sleep(500);
+      },
+    });
+
+  await t.step("stdin closes after the process exits", async () => {
+    const hasOutput = Promise.withResolvers<void>();
+    const stdin = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        // the process exits right after its output
+        await hasOutput.promise;
+        await sleep(100);
+        controller.close();
+      },
+    });
+    const result = await $`deno eval 'console.log(1)'`
+      .stdin(stdin)
+      .stdout(slowWritable(() => hasOutput.resolve()))
+      .stderr("piped")
+      .noThrow();
+    assertEquals(result.stderr, "");
+    assertEquals(result.code, 0);
+  });
+
+  await t.step("stdin writes after the process exits", async () => {
+    const stdin = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await sleep(20);
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+    });
+    const result = await $`deno eval 'console.log(1)'`
+      .stdin(stdin)
+      .stdout(slowWritable())
+      .stderr("piped")
+      .noThrow();
+    assertEquals(result.stderr, "");
+    assertEquals(result.code, 0);
+  });
+
+  await t.step("pipe sequence where the last command exits before reading everything", async () => {
+    const writeLargeOutput = "const data = new Uint8Array(1024 * 1024);"
+      + "for (let i = 0; i < 13; i++) {"
+      + "  let written = 0;"
+      + "  while (written < data.length) written += await Deno.stdout.write(data.subarray(written));"
+      + "}";
+    const readSomeInput = "await Deno.stdin.read(new Uint8Array(10)); console.log(1);";
+    const result = await $`deno eval ${writeLargeOutput} | deno eval ${readSomeInput}`
+      .stdout("piped")
+      .stderr("piped")
+      .noThrow();
+    assertEquals(result.stderr, "");
+    assertEquals(result.stdout, "1\n");
+    assertEquals(result.code, 0);
+  });
 });
 
 Deno.test("pipe", async () => {
