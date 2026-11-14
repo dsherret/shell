@@ -30,7 +30,7 @@ test("captures stderr and the exit code", async () => {
 });
 
 test("resolves executables with which", async () => {
-  // exercises the vendored @david/which code path under node
+  // exercises the @dsherret/which dependency under node
   assert.ok(await which("node"));
   assert.ok(whichSync("node"));
 });
