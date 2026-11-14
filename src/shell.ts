@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { RealEnvironment, which } from "which";
+import { RealEnvironment, which, type WhichOptions } from "which";
 import type { KillSignal } from "./command.ts";
 import type { CommandContext, CommandHandler, CommandPipeReader } from "./commandHandler.ts";
 import { createExecutableCommand } from "./commands/executable.ts";
@@ -1401,7 +1401,11 @@ async function resolveCommand(unresolvedCommand: UnresolvedCommand, context: Con
       : path.resolve(unresolvedCommand.baseDir, unresolvedCommand.name);
     // on Windows, this resolves `./foo` to `./foo.exe` when `./foo` itself
     // doesn't exist but an executable with a PATHEXT extension does
-    const commandPath = await whichFromContext(absolutePath, context);
+    const commandPath = await whichFromContext(absolutePath, context, {
+      // scripts are run by reading their shebang, so they don't need to
+      // be marked as executable
+      requireExecutable: false,
+    });
     if (commandPath == null) {
       return false;
     }
@@ -1462,7 +1466,7 @@ export const whichRealEnv: WhichEnv = new WhichEnv();
 
 export async function whichFromContext(commandName: string, context: {
   getVar(key: string): string | undefined;
-}) {
+}, options?: WhichOptions) {
   return await which(commandName, {
     isWindows,
     stat: whichRealEnv.stat,
@@ -1472,7 +1476,7 @@ export async function whichFromContext(commandName: string, context: {
       return context.getVar(key);
     },
     requestPermission: whichRealEnv.requestPermission,
-  });
+  }, options);
 }
 
 async function executePipeSequence(sequence: PipeSequence, context: Context): Promise<ExecuteResult> {

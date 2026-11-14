@@ -10,7 +10,7 @@
     "jsr:@david/publish-on-tag@0.2.0": "0.2.0",
     "jsr:@david/temp@~0.1.1": "0.1.1",
     "jsr:@david/temp@~0.2.1": "0.2.1",
-    "jsr:@david/which@~0.7.5": "0.7.5",
+    "jsr:@david/which@0.8": "0.8.0",
     "jsr:@deno/dnt@0.44": "0.44.0",
     "jsr:@deno/wasmbuild@0.22": "0.22.0",
     "jsr:@std/assert@1": "1.0.19",
@@ -79,8 +79,8 @@
         "jsr:@david/path@0.3"
       ]
     },
-    "@david/which@0.7.5": {
-      "integrity": "c3083b4463f152c56cc6d00f54bfdfcf6e9f93059f16e6e39f22b7b3e8e17d99"
+    "@david/which@0.8.0": {
+      "integrity": "7095cce2671bcd0fb6c87a15e0b651f44d3fa876cf376bb45cf9322eaee7f3b2"
     },
     "@deno/dnt@0.44.0": {
       "integrity": "87f4cf9f6b87f5d443ed981781440c21106c7097bed07f9b58a5dcaf0d1e7289",
@@ -348,7 +348,7 @@
       "jsr:@david/path@~0.3.4",
       "jsr:@david/publish-on-tag@0.2.0",
       "jsr:@david/temp@~0.2.1",
-      "jsr:@david/which@~0.7.5",
+      "jsr:@david/which@0.8",
       "jsr:@deno/dnt@0.44",
       "jsr:@deno/wasmbuild@0.22",
       "jsr:@std/assert@1",
