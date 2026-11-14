@@ -69,6 +69,6 @@
     "@std/io": "jsr:@std/io@^0.225",
     "@std/path": "jsr:@std/path@1",
     "esbuild": "npm:esbuild@^0.28.1",
-    "which": "jsr:@david/which@^0.7.4"
+    "which": "jsr:@david/which@^0.7.5"
   }
 }

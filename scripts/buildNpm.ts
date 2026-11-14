@@ -43,6 +43,9 @@ await build({
     "jsr:@david/path": {
       name: "@dsherret/path",
     },
+    "jsr:@david/which": {
+      name: "@dsherret/which",
+    },
   },
   polyfills: false,
   compilerOptions: {
