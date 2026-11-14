@@ -1403,7 +1403,8 @@ async function resolveCommand(unresolvedCommand: UnresolvedCommand, context: Con
     // doesn't exist but an executable with a PATHEXT extension does
     const commandPath = await whichFromContext(absolutePath, context, {
       // scripts are run by reading their shebang, so they don't need to
-      // be marked as executable
+      // be marked as executable. Don't bother checking for backwards
+      // compatibility and to not cause needless build failures
       requireExecutable: false,
     });
     if (commandPath == null) {
